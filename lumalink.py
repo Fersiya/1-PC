@@ -450,6 +450,35 @@ class LightBridgeSession:
         val_bytes = struct.pack(">I", int(value))
         return self._wrap_dp_command(self._dp_item(dp_id, 0x02, val_bytes))
 
+    def make_combined_dps(self, dp_items: list[tuple[int, int, bytes]]) -> list[bytes]:
+        """Упаковывает несколько DP (TLV) в единый кадр (атомарное применение)."""
+        combined = bytearray()
+        for dp_id, dp_type, val in dp_items:
+            combined.extend(self._dp_item(dp_id, dp_type, val))
+        return self._wrap_dp_command(bytes(combined))
+
+    def make_color_bundle(
+        self, dp_switch: int, dp_mode: int, dp_colour: int, r: int, g: int, b: int, brightness_scale: float = 1.0, mode_val: int = 1
+    ) -> list[bytes]:
+        """Формирует единый multi-TLV пакет: питание ВКЛ + режим Colour + яркость 1000 + цвет HSV."""
+        h, s, v = colorsys.rgb_to_hsv(r / 255.0, g / 255.0, b / 255.0)
+        if s > 0.01:
+            s = min(1.0, s * 2.2 + 0.12)
+        h_int = int(round(h * 360)) % 360
+        s_int = int(round(s * 1000))
+        v_int = int(round(v * 1000 * max(0.05, min(1.0, brightness_scale))))
+        hsv_ascii = f"{h_int:04x}{s_int:04x}{v_int:04x}".encode("ascii")
+
+        items = [
+            (dp_switch, 0x01, b"\x01"),
+        ]
+        if dp_mode > 0:
+            items.append((dp_mode, 0x04, bytes([mode_val & 0xFF])))
+        items.append((47, 0x02, struct.pack(">I", int(round(1000 * max(0.05, min(1.0, brightness_scale)))))))
+        items.append((dp_colour, 0x03, hsv_ascii))
+
+        return self.make_combined_dps(items)
+
     def make_dp_color_hsv(
         self, dp_id: int, r: int, g: int, b: int, brightness_scale: float
     ) -> list[bytes]:
@@ -643,18 +672,28 @@ class BridgeServerController:
                 await self._send_chunks(ws, chunks)
             elif dp_type == "color":
                 r, g, b = value
-                # Для RGBIC ленты: включаем питание, режим Colour (DP 2 = 1) и яркость 100% (DP 47 = 1000)
                 dp_switch = int(self.get_cfg_snapshot().get("dp_switch", 1))
                 dp_mode = int(self.get_cfg_snapshot().get("dp_mode", 2))
-                await self._send_chunks(ws, session.make_dp_bool(dp_switch, True))
-                await asyncio.sleep(0.08)
-                if dp_mode > 0:
-                    await self._send_chunks(ws, session.make_dp_enum(dp_mode, 1))
-                    await asyncio.sleep(0.08)
-                await self._send_chunks(ws, session.make_dp_value(47, 1000))
-                await asyncio.sleep(0.08)
-                chunks = session.make_dp_color_hsv(dp_id, r, g, b, 1.0)
-                self._emit("log", text=f"Команда: Цвет RGB({r},{g},{b}) на DP {dp_id} (режим 1, яркость 1000) [экран на паузе 30с]")
+                chunks = session.make_color_bundle(dp_switch, dp_mode, dp_id, r, g, b, 1.0)
+                self._emit("log", text=f"Команда: Единый пакет Multi-DP (Питание ВКЛ, Режим 1, Ярк 1000, Цвет RGB({r},{g},{b})) [экран на паузе 30с]")
+                await self._send_chunks(ws, chunks)
+            elif dp_type == "mode":
+                dp_switch = int(self.get_cfg_snapshot().get("dp_switch", 1))
+                mode_val = int(value)
+                mode_names = {0: "White", 1: "Colour", 2: "Scene", 3: "Music"}
+                items = [
+                    (dp_switch, 0x01, b"\x01"),
+                    (dp_id, 0x04, bytes([mode_val & 0xFF])),
+                    (47, 0x02, struct.pack(">I", 1000)),
+                ]
+                chunks = session.make_combined_dps(items)
+                self._emit("log", text=f"Команда: Смена режима Multi-DP (Питание ВКЛ, Режим {mode_val} [{mode_names.get(mode_val, '?')}], Ярк 1000) [экран на паузе 30с]")
+                await self._send_chunks(ws, chunks)
+            elif dp_type == "custom":
+                raw_type = int(value.get("type", 0))
+                raw_bytes = value.get("bytes", b"")
+                chunks = session._wrap_dp_command(session._dp_item(dp_id, raw_type, raw_bytes))
+                self._emit("log", text=f"Команда: Ручной DP {dp_id} (тип {raw_type}, {len(raw_bytes)} Б) = {raw_bytes.hex()} [экран на паузе 30с]")
                 await self._send_chunks(ws, chunks)
         except Exception as e:
             self._emit("log", text=f"Ошибка отправки команды: {e}")
@@ -753,10 +792,12 @@ class BridgeServerController:
         smooth_r, smooth_g, smooth_b = 0.0, 0.0, 0.0
         initialized = False
         last_sent = (-100, -100, -100)
+        first_frame = True
 
         while not ws.closed and session.paired and not self._stop_event.is_set():
             t0 = time.monotonic()
             if time.monotonic() < self.pause_ambilight_until:
+                first_frame = True
                 await asyncio.sleep(0.15)
                 continue
             snap = self.get_cfg_snapshot()
@@ -780,11 +821,17 @@ class BridgeServerController:
             r, g, b = int(round(smooth_r)), int(round(smooth_g)), int(round(smooth_b))
             self._emit("color", rgb=(r, g, b))
 
-            if abs(r - last_sent[0]) + abs(g - last_sent[1]) + abs(b - last_sent[2]) >= 5:
+            if first_frame or abs(r - last_sent[0]) + abs(g - last_sent[1]) + abs(b - last_sent[2]) >= 5:
                 last_sent = (r, g, b)
                 try:
                     await ws.send_str(json.dumps({"rgb": [r, g, b]}))
-                    chunks = session.make_dp_color_hsv(dp_colour, r, g, b, brightness)
+                    if first_frame:
+                        first_frame = False
+                        dp_switch = int(snap.get("dp_switch", 1))
+                        dp_mode = int(snap.get("dp_mode", 2))
+                        chunks = session.make_color_bundle(dp_switch, dp_mode, dp_colour, r, g, b, brightness)
+                    else:
+                        chunks = session.make_dp_color_hsv(dp_colour, r, g, b, brightness)
                     await self._send_chunks(ws, chunks)
                 except Exception:
                     break
@@ -896,14 +943,11 @@ class BridgeServerController:
                                     }
                                 )
                             )
-                            await self._send_chunks(ws, session.make_dp_bool(dp_switch, True))
-                            await asyncio.sleep(0.15)
-                            if dp_mode > 0:
-                                # work_mode: 0 — white, 1 — colour
-                                await self._send_chunks(ws, session.make_dp_enum(dp_mode, 1))
-                                await asyncio.sleep(0.15)
-                            await self._send_chunks(ws, session.make_dp_value(47, 1000))
-                            await asyncio.sleep(0.15)
+                            init_bundle = session.make_color_bundle(
+                                dp_switch, dp_mode, int(snap.get("dp_colour", 24)), 255, 255, 255, 1.0
+                            )
+                            await self._send_chunks(ws, init_bundle)
+                            await asyncio.sleep(0.1)
                             if stream_task:
                                 stream_task.cancel()
                             stream_task = asyncio.create_task(self._ambilight_loop(ws, session))
@@ -1488,7 +1532,7 @@ class LumaLinkApp:
             tk.Button(
                 row_top, text=m_title, font=("Consolas", 8, "bold"), bg=self.BG_INPUT, fg=self.CYAN if m_val == 1 else self.TEXT_PRIMARY,
                 bd=0, padx=4, pady=2, cursor="hand2", activebackground=self.BORDER, activeforeground=self.TEXT_PRIMARY,
-                command=lambda v=m_val: self.controller.send_manual_dp(int(self.var_dp_mode.get() or 2), "enum", v)
+                command=lambda v=m_val: self.controller.send_manual_dp(int(self.var_dp_mode.get() or 2), "mode", v)
             ).pack(side="left", padx=1)
 
         tk.Button(
@@ -1525,6 +1569,62 @@ class LumaLinkApp:
             bd=0, padx=6, pady=2, cursor="hand2", activebackground=self.BORDER, activeforeground=self.TEXT_PRIMARY,
             command=lambda: self.controller.pause_ambilight(120.0)
         ).pack(side="right", padx=(4, 2))
+
+        # Строка ручной отправки любого произвольного DP (для тестирования Dreamlight DP 51, DP 25 и т.д.)
+        row_custom = tk.Frame(test_card, bg=self.BG_CARD)
+        row_custom.pack(fill="x", pady=(6, 0))
+
+        tk.Label(row_custom, text="Тест DP:", font=("Segoe UI", 8, "bold"), fg=self.TEXT_PRIMARY, bg=self.BG_CARD).pack(side="left", padx=(0, 2))
+        self.var_cust_id = tk.StringVar(value="51")
+        entry_cid = tk.Entry(
+            row_custom, textvariable=self.var_cust_id, font=("Consolas", 8), width=4,
+            bg=self.BG_INPUT, fg=self.TEXT_PRIMARY, insertbackground=self.TEXT_PRIMARY, bd=0
+        )
+        entry_cid.pack(side="left", padx=(0, 4))
+        self._attach_entry_context_menu(entry_cid)
+
+        tk.Label(row_custom, text="Тип:", font=("Segoe UI", 8), fg=self.TEXT_MUTED, bg=self.BG_CARD).pack(side="left", padx=(0, 2))
+        self.var_cust_type = tk.StringVar(value="raw_hex")
+        type_cb = ttk.Combobox(
+            row_custom, textvariable=self.var_cust_type, values=["raw_hex", "string", "value", "enum", "bool"],
+            state="readonly", width=8, font=("Consolas", 8)
+        )
+        type_cb.pack(side="left", padx=(0, 4))
+
+        tk.Label(row_custom, text="Данные:", font=("Segoe UI", 8), fg=self.TEXT_MUTED, bg=self.BG_CARD).pack(side="left", padx=(0, 2))
+        self.var_cust_val = tk.StringVar(value="00")
+        entry_cval = tk.Entry(
+            row_custom, textvariable=self.var_cust_val, font=("Consolas", 8),
+            bg=self.BG_INPUT, fg=self.TEXT_PRIMARY, insertbackground=self.TEXT_PRIMARY, bd=0
+        )
+        entry_cval.pack(side="left", fill="x", expand=True, padx=(0, 4))
+        self._attach_entry_context_menu(entry_cval)
+
+        def do_send_custom():
+            try:
+                cid = int(self.var_cust_id.get().strip())
+                ctype = self.var_cust_type.get().strip()
+                val_raw = self.var_cust_val.get().strip()
+                if ctype == "raw_hex":
+                    b = bytes.fromhex(val_raw)
+                    self.controller.send_manual_dp(cid, "custom", {"type": 0x00, "bytes": b})
+                elif ctype == "string":
+                    b = val_raw.encode("utf-8")
+                    self.controller.send_manual_dp(cid, "custom", {"type": 0x03, "bytes": b})
+                elif ctype == "value":
+                    self.controller.send_manual_dp(cid, "value", int(val_raw))
+                elif ctype == "enum":
+                    self.controller.send_manual_dp(cid, "enum", int(val_raw))
+                elif ctype == "bool":
+                    self.controller.send_manual_dp(cid, "bool", val_raw.lower() in ("1", "true", "yes"))
+            except Exception as e:
+                messagebox.showerror("Ошибка", f"Неверные данные DP: {e}")
+
+        tk.Button(
+            row_custom, text="Отправить DP", font=("Segoe UI", 8, "bold"), bg=self.ACCENT, fg=self.TEXT_PRIMARY,
+            bd=0, padx=6, pady=1, cursor="hand2", activebackground=self.ACCENT_HOVER, activeforeground=self.TEXT_PRIMARY,
+            command=do_send_custom
+        ).pack(side="right")
 
         log_card = tk.Frame(
             container, bg=self.BG_CARD, highlightbackground=self.BORDER, highlightthickness=1, padx=12, pady=10
