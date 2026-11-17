@@ -460,7 +460,7 @@ class LightBridgeSession:
     def make_color_bundle(
         self, dp_switch: int, dp_mode: int, dp_colour: int, r: int, g: int, b: int, brightness_scale: float = 1.0, mode_val: int = 1
     ) -> list[bytes]:
-        """Формирует единый multi-TLV пакет: питание ВКЛ + режим Colour + яркость 1000 + цвет HSV."""
+        """Формирует единый multi-TLV пакет: питание ВКЛ + режим Colour + яркость 1000 + цвет HSV + DP 61 (Dreamlight paint_colour_data)."""
         h, s, v = colorsys.rgb_to_hsv(r / 255.0, g / 255.0, b / 255.0)
         if s > 0.01:
             s = min(1.0, s * 2.2 + 0.12)
@@ -469,13 +469,19 @@ class LightBridgeSession:
         v_int = int(round(v * 1000 * max(0.05, min(1.0, brightness_scale))))
         hsv_ascii = f"{h_int:04x}{s_int:04x}{v_int:04x}".encode("ascii")
 
+        # Tuya Dreamlight (RGBIC) real-time paint color format (DP 61):
+        # 00 (версия 0) + 01 (режим цвета) + 00 (эффект) + 14 (число сегментов = 20) + 00 (действие: вся лента) + HHHH + SSSS + VVVV
+        dp61_raw = struct.pack(">BBBBBHHH", 0, 1, 0, 20, 0, h_int, s_int, v_int)
+
         items = [
             (dp_switch, 0x01, b"\x01"),
         ]
         if dp_mode > 0:
             items.append((dp_mode, 0x04, bytes([mode_val & 0xFF])))
         items.append((47, 0x02, struct.pack(">I", int(round(1000 * max(0.05, min(1.0, brightness_scale)))))))
-        items.append((dp_colour, 0x03, hsv_ascii))
+        if dp_colour != 61:
+            items.append((dp_colour, 0x03, hsv_ascii))
+        items.append((61, 0x00, dp61_raw))
 
         return self.make_combined_dps(items)
 
@@ -490,7 +496,15 @@ class LightBridgeSession:
         s_int = int(round(s * 1000))
         v_int = int(round(v * 1000 * max(0.05, min(1.0, brightness_scale))))
         hsv_ascii = f"{h_int:04x}{s_int:04x}{v_int:04x}".encode("ascii")
-        return self._wrap_dp_command(self._dp_item(dp_id, 0x03, hsv_ascii))
+
+        # Tuya Dreamlight (RGBIC) real-time paint color format (DP 61):
+        dp61_raw = struct.pack(">BBBBBHHH", 0, 1, 0, 20, 0, h_int, s_int, v_int)
+
+        items = []
+        if dp_id != 61:
+            items.append((dp_id, 0x03, hsv_ascii))
+        items.append((61, 0x00, dp61_raw))
+        return self.make_combined_dps(items)
 
     @staticmethod
     def parse_dp_payload(code: int, payload: bytes) -> dict:
@@ -675,7 +689,7 @@ class BridgeServerController:
                 dp_switch = int(self.get_cfg_snapshot().get("dp_switch", 1))
                 dp_mode = int(self.get_cfg_snapshot().get("dp_mode", 2))
                 chunks = session.make_color_bundle(dp_switch, dp_mode, dp_id, r, g, b, 1.0)
-                self._emit("log", text=f"Команда: Единый пакет Multi-DP (Питание ВКЛ, Режим 1, Ярк 1000, Цвет RGB({r},{g},{b})) [экран на паузе 30с]")
+                self._emit("log", text=f"Команда: Единый пакет Multi-DP (Питание ВКЛ, Режим 1, Ярк 1000, Цвет RGB({r},{g},{b}), DP61 Dreamlight) [экран на паузе 30с]")
                 await self._send_chunks(ws, chunks)
             elif dp_type == "mode":
                 dp_switch = int(self.get_cfg_snapshot().get("dp_switch", 1))
@@ -1544,7 +1558,7 @@ class LumaLinkApp:
         row_bot = tk.Frame(test_card, bg=self.BG_CARD)
         row_bot.pack(fill="x")
 
-        tk.Label(row_bot, text="Цвет (DP24):", font=("Segoe UI", 8, "bold"), fg=self.TEXT_PRIMARY, bg=self.BG_CARD).pack(side="left", padx=(0, 4))
+        tk.Label(row_bot, text="Цвет (DP24+61):", font=("Segoe UI", 8, "bold"), fg=self.TEXT_PRIMARY, bg=self.BG_CARD).pack(side="left", padx=(0, 4))
         colors_to_test = [
             ("Красный", (255, 0, 0), "#EF4444", "#FFFFFF"),
             ("Зелёный", (0, 255, 0), "#10B981", "#0B0E14"),
@@ -1575,7 +1589,7 @@ class LumaLinkApp:
         row_custom.pack(fill="x", pady=(6, 0))
 
         tk.Label(row_custom, text="Тест DP:", font=("Segoe UI", 8, "bold"), fg=self.TEXT_PRIMARY, bg=self.BG_CARD).pack(side="left", padx=(0, 2))
-        self.var_cust_id = tk.StringVar(value="51")
+        self.var_cust_id = tk.StringVar(value="61")
         entry_cid = tk.Entry(
             row_custom, textvariable=self.var_cust_id, font=("Consolas", 8), width=4,
             bg=self.BG_INPUT, fg=self.TEXT_PRIMARY, insertbackground=self.TEXT_PRIMARY, bd=0
@@ -1592,7 +1606,7 @@ class LumaLinkApp:
         type_cb.pack(side="left", padx=(0, 4))
 
         tk.Label(row_custom, text="Данные:", font=("Segoe UI", 8), fg=self.TEXT_MUTED, bg=self.BG_CARD).pack(side="left", padx=(0, 2))
-        self.var_cust_val = tk.StringVar(value="00")
+        self.var_cust_val = tk.StringVar(value="0001001400000003e803e8")
         entry_cval = tk.Entry(
             row_custom, textvariable=self.var_cust_val, font=("Consolas", 8),
             bg=self.BG_INPUT, fg=self.TEXT_PRIMARY, insertbackground=self.TEXT_PRIMARY, bd=0
