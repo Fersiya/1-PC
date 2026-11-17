@@ -14,6 +14,7 @@ import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 
+from typing import Any
 from aiohttp import web, WSMsgType
 from Crypto.Cipher import AES
 import mss
@@ -602,13 +603,13 @@ class BridgeServerController:
     def _emit(self, event_type: str, **kwargs):
         self.ui_queue.put({"type": event_type, **kwargs})
 
-    def send_manual_dp(self, dp_id: int, dp_type: str, value: Any):
+    def send_manual_dp(self, dp_id: int, dp_type: str, value):
         if not self._loop or not self.running:
             self._emit("log", text="Сервер не запущен — сначала запустите сервер!")
             return
         asyncio.run_coroutine_threadsafe(self._async_send_manual_dp(dp_id, dp_type, value), self._loop)
 
-    async def _async_send_manual_dp(self, dp_id: int, dp_type: str, value: Any):
+    async def _async_send_manual_dp(self, dp_id: int, dp_type: str, value):
         if not self._active_ws or not self._active_session or self._active_ws.closed:
             self._emit("log", text="Нельзя отправить команду: смартфон или лампа не подключены!")
             return
