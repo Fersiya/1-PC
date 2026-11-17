@@ -18,6 +18,12 @@ from aiohttp import web, WSMsgType
 from Crypto.Cipher import AES
 import mss
 
+try:
+    from PIL import Image, ImageDraw, ImageTk
+    HAS_PIL = True
+except Exception:
+    HAS_PIL = False
+
 # Включаем четкое масштабирование шрифтов на Windows High-DPI экранах
 if sys.platform == "win32":
     try:
@@ -101,8 +107,41 @@ def get_local_ips() -> list[str]:
     return sorted(ips)
 
 
+def build_window_icon_image(size: int = 64):
+    if not HAS_PIL:
+        return None
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    pad = 2
+    draw.rounded_rectangle(
+        [pad, pad, size - pad, size - pad],
+        radius=size // 4,
+        fill=(14, 18, 28, 255),
+        outline=(42, 54, 82, 255),
+        width=2,
+    )
+    cx, cy = size / 2.0, size / 2.0
+    ring_r = size * 0.29
+    ring_box = [cx - ring_r, cy - ring_r, cx + ring_r, cy + ring_r]
+    steps = 60
+    for s in range(steps):
+        t = s / steps
+        a0 = -135 + t * 360
+        a1 = a0 + (360 / steps) + 2
+        if t < 0.5:
+            k = t * 2
+            col = (int(124 * k), int(229 + (92 - 229) * k), 255, 255)
+        else:
+            k = (t - 0.5) * 2
+            col = (int(124 + 112 * k), int(92 - 20 * k), int(255 - 102 * k), 255)
+        draw.arc(ring_box, start=a0, end=a1, fill=col, width=max(3, size // 14))
+    d = size * 0.13
+    draw.polygon([(cx, cy - d * 1.2), (cx + d, cy), (cx, cy + d * 1.2), (cx - d, cy)], fill=(248, 250, 252, 255))
+    return img
+
+
 # ==============================================================================
-# ПРОТОКОЛ И ШИФРОВАНИЕ КАНАЛА СВЯЗИ С ЛАМПОЙ (TUYA BLE V4 / V3)
+# ПРОТОКОЛ И ШИФРОВАНИЕ КАНАЛА СВЯЗИ С ЛАМПОЙ (TUYA BLE V4 / V3 / V2)
 # ==============================================================================
 def crc16_modbus(data: bytes) -> int:
     crc = 0xFFFF
@@ -148,68 +187,83 @@ class LightBridgeSession:
         self.local_key = cfg["local_key"].strip().encode("utf-8")
         self.uuid = cfg["device_uuid"].strip().encode("utf-8")[:16]
         self.protocol_version = int(cfg.get("protocol_version", 4))
-        # Стандарт Tuya BLE требует фрагментацию строго по 20 байт на GATT-пакет
-        self.mtu_payload_size = 20
+        self.chunk_size = 20
 
         self.login_key = hashlib.md5(self.local_key[:6]).digest()
+        self.uuid_key = hashlib.md5(self.uuid).digest()
         self.session_key: bytes | None = None
         self.sn = 1
         self.dp_sn = 1
         self.paired = False
+        self.handshake_replied = False
 
         self._rx_buf = bytearray()
         self._rx_expected_len = 0
 
-    def reset(self, protocol_version: int | None = None):
+    def reset(self, protocol_version: int | None = None, chunk_size: int = 20):
         if protocol_version is not None:
             self.protocol_version = protocol_version
-        self.mtu_payload_size = 20
+        self.chunk_size = max(20, min(240, int(chunk_size)))
         self.session_key = None
         self.sn = 1
         self.dp_sn = 1
         self.paired = False
+        self.handshake_replied = False
         self._rx_buf.clear()
         self._rx_expected_len = 0
 
-    def _build_encrypted_frame(
-        self, code: int, data: bytes, ack_sn: int = 0, use_session: bool = True
+    def _build_frame(
+        self,
+        code: int,
+        data: bytes,
+        ack_sn: int = 0,
+        sec_mode: int = 1,
+        proto_ver: int | None = None,
+        chunk_size: int | None = None,
     ) -> list[bytes]:
         sn = self.sn
         self.sn += 1
+
+        ver = proto_ver if proto_ver is not None else self.protocol_version
+        max_pkt = chunk_size if chunk_size is not None else self.chunk_size
 
         header = struct.pack(">IIHH", sn, ack_sn, code, len(data))
         raw = header + data
         crc = crc16_modbus(raw)
         raw_with_crc = raw + struct.pack(">H", crc)
 
-        pad_len = (16 - (len(raw_with_crc) % 16)) % 16
-        padded = raw_with_crc + (b"\x00" * pad_len)
-
-        if use_session and self.session_key:
-            sec_flag = 0x04
-            key = self.session_key
+        if sec_mode == 0:
+            # Нешифрованный заголовок sec_flag=0x00
+            payload_wire = b"\x00" + raw_with_crc
         else:
-            sec_flag = 0x01
-            key = self.login_key
+            pad_len = (16 - (len(raw_with_crc) % 16)) % 16
+            padded = raw_with_crc + (b"\x00" * pad_len)
 
-        iv = os.urandom(16)
-        cipher = AES.new(key, AES.MODE_CBC, iv)
-        encrypted = bytes([sec_flag]) + iv + cipher.encrypt(padded)
+            if sec_mode == 4 and self.session_key:
+                key = self.session_key
+            elif sec_mode == 2:
+                key = self.uuid_key
+            else:
+                sec_mode = 1
+                key = self.login_key
+
+            iv = os.urandom(16)
+            cipher = AES.new(key, AES.MODE_CBC, iv)
+            payload_wire = bytes([sec_mode]) + iv + cipher.encrypt(padded)
 
         chunks = []
         pack_num = 0
         pos = 0
-        total_len = len(encrypted)
-        max_pkt = self.mtu_payload_size
+        total_len = len(payload_wire)
 
         while pos < total_len:
             pkt = bytearray()
             pkt.extend(pack_varint(pack_num))
             if pack_num == 0:
                 pkt.extend(pack_varint(total_len))
-                pkt.append(self.protocol_version << 4)
+                pkt.append(ver << 4)
             space = max_pkt - len(pkt)
-            pkt.extend(encrypted[pos : pos + space])
+            pkt.extend(payload_wire[pos : pos + space])
             pos += space
             pack_num += 1
             chunks.append(bytes(pkt))
@@ -232,23 +286,30 @@ class LightBridgeSession:
         if self._rx_expected_len == 0 or len(self._rx_buf) < self._rx_expected_len:
             return None
 
-        encrypted = bytes(self._rx_buf[: self._rx_expected_len])
+        wire = bytes(self._rx_buf[: self._rx_expected_len])
         self._rx_buf.clear()
         self._rx_expected_len = 0
 
-        if len(encrypted) < 33:
-            raise ValueError(f"Пакет BLE слишком короткий ({len(encrypted)} байт)")
+        sec_flag = wire[0]
+        if sec_flag == 0x00:
+            decrypted = wire[1:]
+        else:
+            if len(wire) < 33:
+                raise ValueError(f"Пакет BLE слишком короткий ({len(wire)} байт)")
+            iv = wire[1:17]
+            ciphertext = wire[17:]
+            if len(ciphertext) % 16 != 0:
+                ciphertext = ciphertext[: (len(ciphertext) // 16) * 16]
 
-        sec_flag = encrypted[0]
-        iv = encrypted[1:17]
-        ciphertext = encrypted[17:]
-        if len(ciphertext) % 16 != 0:
-            ciphertext = ciphertext[: (len(ciphertext) // 16) * 16]
+            if sec_flag == 0x04 and self.session_key:
+                key = self.session_key
+            elif sec_flag == 0x02:
+                key = self.uuid_key
+            else:
+                key = self.login_key
 
-        key = self.session_key if (sec_flag == 0x04 and self.session_key) else self.login_key
-
-        cipher = AES.new(key, AES.MODE_CBC, iv)
-        decrypted = cipher.decrypt(ciphertext)
+            cipher = AES.new(key, AES.MODE_CBC, iv)
+            decrypted = cipher.decrypt(ciphertext)
 
         sn, ack_sn, code, data_len = struct.unpack(">IIHH", decrypted[:12])
         if 12 + data_len > len(decrypted):
@@ -257,8 +318,17 @@ class LightBridgeSession:
         payload = decrypted[12 : 12 + data_len]
         return sn, code, payload
 
-    def make_device_info_req(self) -> list[bytes]:
-        return self._build_encrypted_frame(code=0x0000, data=b"", use_session=False)
+    def make_probe_req(self, proto_ver: int, sec_mode: int, chunk_size: int) -> list[bytes]:
+        self.protocol_version = proto_ver
+        self.chunk_size = chunk_size
+        self.sn = 1
+        return self._build_frame(
+            code=0x0000,
+            data=b"",
+            sec_mode=sec_mode,
+            proto_ver=proto_ver,
+            chunk_size=chunk_size,
+        )
 
     def handle_device_info_resp(self, payload: bytes) -> list[bytes]:
         if len(payload) < 12:
@@ -268,15 +338,15 @@ class LightBridgeSession:
         srand = payload[6:12]
         self.session_key = hashlib.md5(self.local_key[:6] + srand).digest()
         pair_payload = self.uuid + self.local_key[:6] + self.device_id.ljust(16, b"\x00")
-        return self._build_encrypted_frame(code=0x0001, data=pair_payload, use_session=True)
+        return self._build_frame(code=0x0001, data=pair_payload, sec_mode=4)
 
     def _wrap_dp_command(self, dp_packet: bytes) -> list[bytes]:
         if self.protocol_version >= 4:
             sn = self.dp_sn
             self.dp_sn += 1
             v4_data = struct.pack(">IB", sn, 0x00) + dp_packet
-            return self._build_encrypted_frame(code=0x0027, data=v4_data, use_session=True)
-        return self._build_encrypted_frame(code=0x0002, data=dp_packet, use_session=True)
+            return self._build_frame(code=0x0027, data=v4_data, sec_mode=4)
+        return self._build_frame(code=0x0002, data=dp_packet, sec_mode=4)
 
     def make_dp_bool(self, dp_id: int, value: bool) -> list[bytes]:
         dp_packet = struct.pack(">BBH", dp_id, 0x01, 1) + (b"\x01" if value else b"\x00")
@@ -346,7 +416,7 @@ def capture_screen_rgb(mode: str = "fullscreen") -> tuple[int, int, int]:
 
 
 # ==============================================================================
-# ФОНОВЫЙ СЕРВЕР (WEBSOCKET + UDP DISCOVERY)
+# ФОНОВЫЙ СЕРВЕР (WEBSOCKET + UDP DISCOVERY + АВТОПОДБОР ПРОТОКОЛА)
 # ==============================================================================
 class BridgeServerController:
     def __init__(self, ui_queue: queue.Queue, cfg: dict):
@@ -432,6 +502,36 @@ class BridgeServerController:
         for chunk in chunks:
             await ws.send_bytes(chunk)
 
+    async def _handshake_probe_loop(
+        self, ws: web.WebSocketResponse, session: LightBridgeSession, mtu: int
+    ):
+        full_chunk = max(20, min(240, mtu - 3))
+        pref_ver = int(self.get_cfg_snapshot().get("protocol_version", 4))
+        alt_ver = 3 if pref_ver == 4 else 4
+
+        # Перебираем все варианты кадров Tuya BLE за 10 секунд до получения ответа
+        probes = [
+            (pref_ver, 1, 20, f"v{pref_ver} key1 20B"),
+            (pref_ver, 1, full_chunk, f"v{pref_ver} key1 MTU"),
+            (alt_ver, 1, 20, f"v{alt_ver} key1 20B"),
+            (alt_ver, 1, full_chunk, f"v{alt_ver} key1 MTU"),
+            (2, 1, 20, "v2 key1 20B"),
+            (pref_ver, 0, 20, f"v{pref_ver} plain 20B"),
+            (alt_ver, 0, 20, f"v{alt_ver} plain 20B"),
+            (alt_ver, 2, 20, f"v{alt_ver} uuid-key 20B"),
+        ]
+
+        for p_ver, s_mode, c_size, label in probes:
+            if ws.closed or session.handshake_replied or self._stop_event.is_set():
+                return
+            chunks = session.make_probe_req(p_ver, s_mode, c_size)
+            self._emit("log", text=f"Автоподбор BLE -> проба [{label}] ({len(chunks)} пак.)")
+            try:
+                await self._send_chunks(ws, chunks)
+            except Exception:
+                return
+            await asyncio.sleep(1.35)
+
     async def _ambilight_loop(self, ws: web.WebSocketResponse, session: LightBridgeSession):
         smooth_r, smooth_g, smooth_b = 0.0, 0.0, 0.0
         initialized = False
@@ -480,6 +580,7 @@ class BridgeServerController:
         session = LightBridgeSession(snap)
         dp_switch = int(snap.get("dp_switch", 20))
         stream_task: asyncio.Task | None = None
+        probe_task: asyncio.Task | None = None
 
         peer = request.remote or "Смартфон"
         self._emit("client_state", connected=True, text=f"Подключён телефон ({peer})")
@@ -490,28 +591,33 @@ class BridgeServerController:
                 if msg.type == WSMsgType.TEXT:
                     data = json.loads(msg.data)
                     if data.get("type") == "ble_connected":
-                        cur_proto = int(self.get_cfg_snapshot().get("protocol_version", 4))
                         mtu = int(data.get("mtu", 23))
-                        w_props = data.get("write_props", "?")
-                        session.reset(protocol_version=cur_proto)
-                        chunks = session.make_device_info_req()
-                        self._emit(
-                            "log",
-                            text=f"Канал BLE (MTU={mtu}, props={w_props}) -> TX {len(chunks)}x20B (v{cur_proto})",
+                        session.reset()
+                        if probe_task:
+                            probe_task.cancel()
+                        probe_task = asyncio.create_task(
+                            self._handshake_probe_loop(ws, session, mtu)
                         )
-                        await self._send_chunks(ws, chunks)
 
                     elif data.get("type") == "ble_tx_err":
-                        self._emit("log", text=f"Ошибка записи BLE на телефоне: status={data.get('status')}, len={data.get('len')}")
+                        self._emit(
+                            "log",
+                            text=f"Ошибка записи BLE: status={data.get('status')}, len={data.get('len')}",
+                        )
 
                     elif data.get("type") == "ble_disconnected":
                         session.reset()
+                        if probe_task:
+                            probe_task.cancel()
                         if stream_task:
                             stream_task.cancel()
                         self._emit("client_state", connected=True, text="Телефон на связи • Лампа отключена")
                         self._emit("log", text="Лампа отключилась от телефона")
 
                 elif msg.type == WSMsgType.BINARY:
+                    session.handshake_replied = True
+                    if probe_task:
+                        probe_task.cancel()
                     self._emit("log", text=f"BLE RX ({len(msg.data)} байт): {msg.data.hex()}")
                     parsed = session.feed_ble_chunk(msg.data)
                     if not parsed:
@@ -559,6 +665,8 @@ class BridgeServerController:
             except Exception:
                 pass
         finally:
+            if probe_task:
+                probe_task.cancel()
             if stream_task:
                 stream_task.cancel()
             self._emit("client_state", connected=False, text="Ожидание подключения телефона...")
@@ -590,7 +698,7 @@ class BridgeServerController:
 
 
 # ==============================================================================
-# ГРАФИЧЕСКИЙ ИНТЕРФЕЙС WINDOWS (TKINTER)
+# ГРАФИЧЕСКИЙ ИНТЕРФЕЙС WINDOWS (TKINTER + ПОДДЕРЖКА CTRL+C/V В RU РАСКЛАДКЕ)
 # ==============================================================================
 class LumaLinkApp:
     BG_MAIN = "#0B0E14"
@@ -608,9 +716,11 @@ class LumaLinkApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title(f"{APP_NAME} — {APP_SUBTITLE}")
-        self.root.geometry("560x790")
+        self.root.geometry("560x800")
         self.root.minsize(520, 720)
         self.root.configure(bg=self.BG_MAIN)
+
+        self._apply_window_icon()
 
         self.cfg = load_config()
         self.ui_queue: queue.Queue = queue.Queue()
@@ -618,6 +728,7 @@ class LumaLinkApp:
         self.ips = get_local_ips()
         self.primary_ip = self.ips[0] if self.ips else "192.168.1.X"
 
+        self._setup_clipboard_shortcuts()
         self._build_ui()
         self._poll_queue()
 
@@ -625,6 +736,151 @@ class LumaLinkApp:
             self.controller.start()
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _apply_window_icon(self):
+        try:
+            pil_img = build_window_icon_image(64)
+            if pil_img is not None:
+                self._tk_icon = ImageTk.PhotoImage(pil_img)
+                self.root.iconphoto(True, self._tk_icon)
+        except Exception:
+            pass
+
+    def _setup_clipboard_shortcuts(self):
+        # Фикс Ctrl+C / Ctrl+V / Ctrl+X / Ctrl+A для русской раскладки клавиатуры на Windows
+        def on_ctrl_key(event):
+            widget = self.root.focus_get()
+            if not isinstance(widget, (tk.Entry, tk.Text)):
+                return None
+
+            kc = event.keycode
+            if kc == 86:  # V -> Вставить
+                if isinstance(widget, tk.Entry):
+                    try:
+                        clip = self.root.clipboard_get()
+                        if widget.selection_present():
+                            widget.delete("sel.first", "sel.last")
+                        widget.insert("insert", clip)
+                    except Exception:
+                        pass
+                    return "break"
+            elif kc == 67:  # C -> Копировать
+                try:
+                    if isinstance(widget, tk.Entry) and widget.selection_present():
+                        text = widget.selection_get()
+                    elif isinstance(widget, tk.Text) and widget.tag_ranges("sel"):
+                        text = widget.get("sel.first", "sel.last")
+                    else:
+                        return "break"
+                    self.root.clipboard_clear()
+                    self.root.clipboard_append(text)
+                except Exception:
+                    pass
+                return "break"
+            elif kc == 88:  # X -> Вырезать
+                if isinstance(widget, tk.Entry) and widget.selection_present():
+                    try:
+                        text = widget.selection_get()
+                        self.root.clipboard_clear()
+                        self.root.clipboard_append(text)
+                        widget.delete("sel.first", "sel.last")
+                    except Exception:
+                        pass
+                    return "break"
+            elif kc == 65:  # A -> Выделить всё
+                if isinstance(widget, tk.Entry):
+                    widget.select_range(0, "end")
+                    widget.icursor("end")
+                elif isinstance(widget, tk.Text):
+                    widget.tag_add("sel", "1.0", "end")
+                return "break"
+            return None
+
+        self.root.bind_all("<Control-KeyPress>", on_ctrl_key)
+
+    def _attach_entry_context_menu(self, entry: tk.Entry):
+        menu = tk.Menu(
+            entry,
+            tearoff=0,
+            bg=self.BG_INPUT,
+            fg=self.TEXT_PRIMARY,
+            activebackground=self.ACCENT,
+            activeforeground=self.TEXT_PRIMARY,
+            bd=0,
+        )
+
+        def do_cut():
+            if entry.selection_present():
+                self.root.clipboard_clear()
+                self.root.clipboard_append(entry.selection_get())
+                entry.delete("sel.first", "sel.last")
+
+        def do_copy():
+            if entry.selection_present():
+                self.root.clipboard_clear()
+                self.root.clipboard_append(entry.selection_get())
+
+        def do_paste():
+            try:
+                clip = self.root.clipboard_get()
+                if entry.selection_present():
+                    entry.delete("sel.first", "sel.last")
+                entry.insert("insert", clip)
+            except Exception:
+                pass
+
+        def do_select_all():
+            entry.focus_set()
+            entry.select_range(0, "end")
+            entry.icursor("end")
+
+        menu.add_command(label="Вырезать", command=do_cut)
+        menu.add_command(label="Копировать", command=do_copy)
+        menu.add_command(label="Вставить", command=do_paste)
+        menu.add_separator()
+        menu.add_command(label="Выделить всё", command=do_select_all)
+
+        def show_menu(event):
+            entry.focus_set()
+            menu.tk_popup(event.x_root, event.y_root)
+
+        entry.bind("<Button-3>", show_menu)
+
+    def _attach_log_context_menu(self, text_widget: tk.Text):
+        menu = tk.Menu(
+            text_widget,
+            tearoff=0,
+            bg=self.BG_INPUT,
+            fg=self.TEXT_PRIMARY,
+            activebackground=self.ACCENT,
+            activeforeground=self.TEXT_PRIMARY,
+            bd=0,
+        )
+
+        def copy_sel():
+            try:
+                if text_widget.tag_ranges("sel"):
+                    self.root.clipboard_clear()
+                    self.root.clipboard_append(text_widget.get("sel.first", "sel.last"))
+            except Exception:
+                pass
+
+        def copy_all():
+            try:
+                content = text_widget.get("1.0", "end").strip()
+                self.root.clipboard_clear()
+                self.root.clipboard_append(content)
+            except Exception:
+                pass
+
+        menu.add_command(label="Копировать выделенное", command=copy_sel)
+        menu.add_command(label="Копировать весь журнал", command=copy_all)
+
+        def show_menu(event):
+            text_widget.focus_set()
+            menu.tk_popup(event.x_root, event.y_root)
+
+        text_widget.bind("<Button-3>", show_menu)
 
     def _is_config_valid(self, silent: bool = False) -> bool:
         dev_id = self.var_dev_id.get().strip()
@@ -833,16 +1089,20 @@ class LumaLinkApp:
         dp_row = tk.Frame(keys_card, bg=self.BG_CARD)
         dp_row.pack(fill="x", pady=(4, 8))
         tk.Label(dp_row, text="DP Питание:", font=("Segoe UI", 9), fg=self.TEXT_MUTED, bg=self.BG_CARD).pack(side="left")
-        tk.Entry(
+        ent_sw = tk.Entry(
             dp_row, textvariable=self.var_dp_switch, width=4, font=("Consolas", 10),
             fg=self.TEXT_PRIMARY, bg=self.BG_INPUT, insertbackground=self.TEXT_PRIMARY, bd=0
-        ).pack(side="left", padx=(4, 10), ipady=3)
+        )
+        ent_sw.pack(side="left", padx=(4, 10), ipady=3)
+        self._attach_entry_context_menu(ent_sw)
 
         tk.Label(dp_row, text="DP Цвет:", font=("Segoe UI", 9), fg=self.TEXT_MUTED, bg=self.BG_CARD).pack(side="left")
-        tk.Entry(
+        ent_col = tk.Entry(
             dp_row, textvariable=self.var_dp_colour, width=4, font=("Consolas", 10),
             fg=self.TEXT_PRIMARY, bg=self.BG_INPUT, insertbackground=self.TEXT_PRIMARY, bd=0
-        ).pack(side="left", padx=(4, 12), ipady=3)
+        )
+        ent_col.pack(side="left", padx=(4, 12), ipady=3)
+        self._attach_entry_context_menu(ent_col)
 
         tk.Label(dp_row, text="Протокол:", font=("Segoe UI", 9), fg=self.TEXT_MUTED, bg=self.BG_CARD).pack(side="left")
         for p_val, p_lbl in [(4, "v4 (FD50)"), (3, "v3")]:
@@ -911,6 +1171,7 @@ class LumaLinkApp:
             state="disabled",
         )
         self.log_text.pack(fill="both", expand=True)
+        self._attach_log_context_menu(self.log_text)
 
     def _add_slider(self, parent, title: str, var: tk.IntVar, frm: int, to: int, suffix: str):
         row = tk.Frame(parent, bg=self.BG_CARD)
@@ -959,6 +1220,7 @@ class LumaLinkApp:
             bd=0,
         )
         entry.pack(side="left", fill="x", expand=True, ipady=4, padx=(4, 0))
+        self._attach_entry_context_menu(entry)
 
     def _collect_cfg(self) -> dict:
         self.cfg.update(

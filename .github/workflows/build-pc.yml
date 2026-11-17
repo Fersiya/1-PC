@@ -6,8 +6,12 @@ on:
     paths:
       - 'lumalink.py'
       - 'requirements.txt'
+      - 'icon.ico'
       - '.github/workflows/build-pc.yml'
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build-exe:
@@ -28,10 +32,17 @@ jobs:
 
       - name: Build LumaLink GUI EXE
         run: |
-          pyinstaller --onefile --windowed --clean --name LumaLink lumalink.py
+          pyinstaller --onefile --windowed --clean --icon=icon.ico --name LumaLink lumalink.py
 
       - name: Upload Windows EXE artifact
         uses: actions/upload-artifact@v4
         with:
           name: LumaLink-Windows
           path: dist/LumaLink.exe
+
+      - name: Publish to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: LumaLink Windows (Latest)
+          files: dist/LumaLink.exe
