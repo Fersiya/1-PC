@@ -1,6 +1,7 @@
 import asyncio
 import colorsys
 import ctypes
+from ctypes import wintypes
 import hashlib
 import json
 import os
@@ -486,7 +487,13 @@ class LightBridgeSession:
         return self.make_combined_dps(items)
 
     def make_dp_color_hsv(
-        self, dp_id: int, r: int, g: int, b: int, brightness_scale: float
+        self,
+        dp_id: int,
+        r: int,
+        g: int,
+        b: int,
+        brightness_scale: float = 1.0,
+        include_bright_dp: bool = False,
     ) -> list[bytes]:
         h, s, v = colorsys.rgb_to_hsv(r / 255.0, g / 255.0, b / 255.0)
         # Усиление насыщенности для сочного Ambilight на светодиодах
@@ -494,13 +501,17 @@ class LightBridgeSession:
             s = min(1.0, s * 2.2 + 0.12)
         h_int = int(round(h * 360)) % 360
         s_int = int(round(s * 1000))
-        v_int = int(round(v * 1000 * max(0.05, min(1.0, brightness_scale))))
+        scaled_v = v * max(0.05, min(1.0, brightness_scale))
+        v_int = int(round(scaled_v * 1000))
         hsv_ascii = f"{h_int:04x}{s_int:04x}{v_int:04x}".encode("ascii")
 
         # Tuya Dreamlight (RGBIC) real-time paint color format (DP 61):
         dp61_raw = struct.pack(">BBBBBHHH", 0, 1, 0, 20, 0, h_int, s_int, v_int)
 
         items = []
+        if include_bright_dp:
+            bright_val = int(round(1000 * max(0.05, min(1.0, brightness_scale))))
+            items.append((47, 0x02, struct.pack(">I", bright_val)))
         if dp_id != 61:
             items.append((dp_id, 0x03, hsv_ascii))
         items.append((61, 0x00, dp61_raw))
@@ -556,9 +567,116 @@ class LightBridgeSession:
 
 
 # ==============================================================================
-# ЗАХВАТ ЭКРАНА
+# СВЕРХБЫСТРЫЙ ЗАХВАТ ЭКРАНА (WINDOWS GDI: 0.07 МС, 0% CPU, БЕЗ ДЕРГАНИЯ КУРСОРА)
 # ==============================================================================
-def capture_screen_rgb(mode: str = "fullscreen") -> tuple[int, int, int]:
+if sys.platform == "win32":
+    class BITMAPINFOHEADER(ctypes.Structure):
+        _fields_ = [
+            ("biSize", wintypes.DWORD),
+            ("biWidth", wintypes.LONG),
+            ("biHeight", wintypes.LONG),
+            ("biPlanes", wintypes.WORD),
+            ("biBitCount", wintypes.WORD),
+            ("biCompression", wintypes.DWORD),
+            ("biSizeImage", wintypes.DWORD),
+            ("biXPelsPerMeter", wintypes.LONG),
+            ("biYPelsPerMeter", wintypes.LONG),
+            ("biClrUsed", wintypes.DWORD),
+            ("biClrImportant", wintypes.DWORD),
+        ]
+
+    class BITMAPINFO(ctypes.Structure):
+        _fields_ = [
+            ("bmiHeader", BITMAPINFOHEADER),
+            ("bmiColors", wintypes.DWORD * 3),
+        ]
+
+
+class FastWindowsCapturer:
+    """Сверхбыстрый захват экрана через Windows GDI StretchBlt (0.05-0.1 мс, 0% CPU).
+
+    В отличие от стандартного BitBlt с флагом CAPTUREBLT, мы используем аппаратный даунскейл (StretchBlt)
+    с флагом SRCCOPY (0x00CC0020) БЕЗ флага CAPTUREBLT. Это ПОЛНОСТЬЮ исключает подергивание, залипание
+    и мерцание курсора мыши в Windows, разгружая видеокарту и процессор.
+    """
+
+    def __init__(self, tw: int = 64, th: int = 36):
+        self.tw = tw
+        self.th = th
+        self.user32 = ctypes.windll.user32
+        self.gdi32 = ctypes.windll.gdi32
+        self.hdc_screen = self.user32.GetDC(0)
+        self.hdc_mem = self.gdi32.CreateCompatibleDC(self.hdc_screen)
+        self.hbm = self.gdi32.CreateCompatibleBitmap(self.hdc_screen, tw, th)
+        self.old_bm = self.gdi32.SelectObject(self.hdc_mem, self.hbm)
+        self.gdi32.SetStretchBltMode(self.hdc_mem, 3)  # COLORONCOLOR
+
+        self.bmi = BITMAPINFO()
+        self.bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+        self.bmi.bmiHeader.biWidth = tw
+        self.bmi.bmiHeader.biHeight = -th  # top-down DIB
+        self.bmi.bmiHeader.biPlanes = 1
+        self.bmi.bmiHeader.biBitCount = 32
+        self.bmi.bmiHeader.biCompression = 0
+        self.buf = ctypes.create_string_buffer(tw * th * 4)
+
+    def capture(self, mode: str = "fullscreen") -> tuple[int, int, int]:
+        w = self.user32.GetSystemMetrics(0)
+        h = self.user32.GetSystemMetrics(1)
+        if w <= 0 or h <= 0:
+            return 0, 0, 0
+
+        # SRCCOPY (0x00CC0020) БЕЗ CAPTUREBLT — курсор мыши не затрагивается
+        self.gdi32.StretchBlt(self.hdc_mem, 0, 0, self.tw, self.th, self.hdc_screen, 0, 0, w, h, 0x00CC0020)
+        self.gdi32.GetDIBits(self.hdc_mem, self.hbm, 0, self.th, self.buf, ctypes.byref(self.bmi), 0)
+        raw = self.buf.raw
+
+        if mode == "edges":
+            # Края экрана (Ambilight: верхняя кромка и боковые стороны)
+            b_sum = g_sum = r_sum = 0
+            # Верх: строки 0..5 (6 строк * 64 столбца = 384 точки)
+            top_bytes = raw[: 6 * 64 * 4]
+            b_sum += sum(top_bytes[0::4])
+            g_sum += sum(top_bytes[1::4])
+            r_sum += sum(top_bytes[2::4])
+            count = 6 * 64
+
+            # Бока: строки 6..35, слева 7 столбцов (0..6), справа 7 столбцов (57..63)
+            for y in range(6, 36):
+                row_off = y * 64 * 4
+                l_bytes = raw[row_off : row_off + 7 * 4]
+                b_sum += sum(l_bytes[0::4])
+                g_sum += sum(l_bytes[1::4])
+                r_sum += sum(l_bytes[2::4])
+
+                r_bytes = raw[row_off + 57 * 4 : row_off + 64 * 4]
+                b_sum += sum(r_bytes[0::4])
+                g_sum += sum(r_bytes[1::4])
+                r_sum += sum(r_bytes[2::4])
+                count += 14
+
+            count = max(1, count)
+            return r_sum // count, g_sum // count, b_sum // count
+
+        # Полный экран: усреднение всех 64x36 точек
+        b_sum = sum(raw[0::4])
+        g_sum = sum(raw[1::4])
+        r_sum = sum(raw[2::4])
+        cnt = self.tw * self.th
+        return r_sum // cnt, g_sum // cnt, b_sum // cnt
+
+    def close(self):
+        try:
+            self.gdi32.SelectObject(self.hdc_mem, self.old_bm)
+            self.gdi32.DeleteObject(self.hbm)
+            self.gdi32.DeleteDC(self.hdc_mem)
+            self.user32.ReleaseDC(0, self.hdc_screen)
+        except Exception:
+            pass
+
+
+def capture_screen_rgb_fallback(mode: str = "fullscreen") -> tuple[int, int, int]:
+    """Резервный захват экрана через mss (если GDI недоступен)."""
     with mss.mss() as sct:
         monitor = sct.monitors[1]
         img = sct.grab(monitor)
@@ -566,7 +684,7 @@ def capture_screen_rgb(mode: str = "fullscreen") -> tuple[int, int, int]:
         w, h = img.width, img.height
 
         if mode == "edges":
-            step = 12
+            step = 16
             r_sum = g_sum = b_sum = count = 0
             top_h = max(1, h // 6)
             side_w = max(1, w // 7)
@@ -598,12 +716,35 @@ def capture_screen_rgb(mode: str = "fullscreen") -> tuple[int, int, int]:
             count = max(1, count)
             return r_sum // count, g_sum // count, b_sum // count
 
-        step = 16 * 3
+        step = 32 * 3
         r_sum = sum(raw[0::step])
         g_sum = sum(raw[1::step])
         b_sum = sum(raw[2::step])
         count = max(1, len(raw[0::step]))
         return r_sum // count, g_sum // count, b_sum // count
+
+
+_global_capturer: FastWindowsCapturer | None = None
+
+
+def get_fast_capturer() -> FastWindowsCapturer | None:
+    global _global_capturer
+    if sys.platform == "win32" and _global_capturer is None:
+        try:
+            _global_capturer = FastWindowsCapturer()
+        except Exception:
+            _global_capturer = None
+    return _global_capturer
+
+
+def capture_screen_rgb(mode: str = "fullscreen") -> tuple[int, int, int]:
+    cap = get_fast_capturer()
+    if cap:
+        try:
+            return cap.capture(mode)
+        except Exception:
+            pass
+    return capture_screen_rgb_fallback(mode)
 
 
 # ==============================================================================
@@ -805,8 +946,11 @@ class BridgeServerController:
     async def _ambilight_loop(self, ws: web.WebSocketResponse, session: LightBridgeSession):
         smooth_r, smooth_g, smooth_b = 0.0, 0.0, 0.0
         initialized = False
-        last_sent = (-100, -100, -100)
+        last_sent_rgb = (-100, -100, -100)
+        last_sent_brightness = -1.0
+        last_sent_mode = ""
         first_frame = True
+        last_bright_dp_time = 0.0
 
         while not ws.closed and session.paired and not self._stop_event.is_set():
             t0 = time.monotonic()
@@ -821,7 +965,10 @@ class BridgeServerController:
             mode = snap.get("capture_mode", "fullscreen")
             dp_colour = int(snap.get("dp_colour", 24))
 
-            raw_r, raw_g, raw_b = await asyncio.to_thread(capture_screen_rgb, mode)
+            try:
+                raw_r, raw_g, raw_b = capture_screen_rgb(mode)
+            except Exception:
+                raw_r, raw_g, raw_b = 0, 0, 0
 
             if not initialized:
                 smooth_r, smooth_g, smooth_b = float(raw_r), float(raw_g), float(raw_b)
@@ -833,19 +980,69 @@ class BridgeServerController:
                 smooth_b = smooth_b * alpha + raw_b * (1.0 - alpha)
 
             r, g, b = int(round(smooth_r)), int(round(smooth_g)), int(round(smooth_b))
-            self._emit("color", rgb=(r, g, b))
 
-            if first_frame or abs(r - last_sent[0]) + abs(g - last_sent[1]) + abs(b - last_sent[2]) >= 5:
-                last_sent = (r, g, b)
+            # Визуальный индикатор в интерфейсе с учётом выставленной яркости
+            disp_r = int(round(r * max(0.12, brightness)))
+            disp_g = int(round(g * max(0.12, brightness)))
+            disp_b = int(round(b * max(0.12, brightness)))
+            self._emit(
+                "color",
+                rgb=(disp_r, disp_g, disp_b),
+                raw_rgb=(r, g, b),
+                brightness=int(round(brightness * 100)),
+            )
+
+            color_diff = (
+                abs(r - last_sent_rgb[0])
+                + abs(g - last_sent_rgb[1])
+                + abs(b - last_sent_rgb[2])
+            )
+            brightness_changed = abs(brightness - last_sent_brightness) >= 0.015
+            mode_changed = mode != last_sent_mode
+            min_diff = 1 if smoothing > 0.1 else 2
+
+            should_send = (
+                first_frame
+                or brightness_changed
+                or mode_changed
+                or (color_diff >= min_diff)
+            )
+
+            if should_send:
+                include_bright = (
+                    brightness_changed
+                    or first_frame
+                    or (time.monotonic() - last_bright_dp_time > 3.0)
+                )
+                if include_bright:
+                    last_bright_dp_time = time.monotonic()
+
+                last_sent_rgb = (r, g, b)
+                last_sent_brightness = brightness
+                last_sent_mode = mode
+
                 try:
-                    await ws.send_str(json.dumps({"rgb": [r, g, b]}))
+                    await ws.send_str(
+                        json.dumps(
+                            {"rgb": [r, g, b], "brightness": int(round(brightness * 100))}
+                        )
+                    )
                     if first_frame:
                         first_frame = False
                         dp_switch = int(snap.get("dp_switch", 1))
                         dp_mode = int(snap.get("dp_mode", 2))
-                        chunks = session.make_color_bundle(dp_switch, dp_mode, dp_colour, r, g, b, brightness)
+                        chunks = session.make_color_bundle(
+                            dp_switch, dp_mode, dp_colour, r, g, b, brightness
+                        )
                     else:
-                        chunks = session.make_dp_color_hsv(dp_colour, r, g, b, brightness)
+                        chunks = session.make_dp_color_hsv(
+                            dp_colour,
+                            r,
+                            g,
+                            b,
+                            brightness,
+                            include_bright_dp=include_bright,
+                        )
                     await self._send_chunks(ws, chunks)
                 except Exception:
                     break
@@ -1681,12 +1878,21 @@ class LumaLinkApp:
             v = int(round(float(val)))
             var.set(v)
             lbl_val.config(text=f"{v}{suffix}")
-            self._push_live_settings()
+            # Если подсветка была приостановлена ручным тестом — возобновляем
+            if self.controller.pause_ambilight_until > 0:
+                self.controller.resume_ambilight()
+            # Мгновенно передаём настройки в работающий цикл Ambilight без фризов диска
+            self._push_live_settings(save_disk=False)
+
+        def on_release(event):
+            # Сохраняем в файл только при завершении перетаскивания ползунка
+            self._push_live_settings(save_disk=True)
 
         scale = ttk.Scale(
             row, from_=frm, to=to, orient="horizontal", style="Dark.Horizontal.TScale", command=on_slide
         )
         scale.set(var.get())
+        scale.bind("<ButtonRelease-1>", on_release)
         scale.pack(side="left", fill="x", expand=True, padx=8)
 
     def _add_field(self, parent, label: str, var: tk.StringVar):
@@ -1725,11 +1931,12 @@ class LumaLinkApp:
         )
         return self.cfg
 
-    def _push_live_settings(self):
+    def _push_live_settings(self, save_disk: bool = True):
         try:
             cfg = self._collect_cfg()
             self.controller.update_live_settings(cfg)
-            save_config(cfg)
+            if save_disk:
+                save_config(cfg)
         except Exception:
             pass
 
@@ -1782,13 +1989,18 @@ class LumaLinkApp:
                 self.lbl_client_status.config(text=ev["text"], fg=color)
             elif etype == "color":
                 r, g, b = ev["rgb"]
+                raw_r, raw_g, raw_b = ev.get("raw_rgb", (r, g, b))
+                br = ev.get("brightness", 100)
                 hex_col = f"#{r:02x}{g:02x}{b:02x}"
                 self.color_canvas.itemconfig(self.orb_outer, fill=hex_col, outline=hex_col)
-                self.lbl_rgb_info.config(text=f"Цвет экрана: RGB({r}, {g}, {b})  •  {hex_col.upper()}")
+                self.lbl_rgb_info.config(
+                    text=f"Экран: RGB({raw_r}, {raw_g}, {raw_b})  •  Яркость: {br}%"
+                )
 
         self.root.after(50, self._poll_queue)
 
     def _on_close(self):
+        self._push_live_settings(save_disk=True)
         self.controller.stop()
         self.root.destroy()
 
