@@ -1,10 +1,10 @@
-name: Build Windows EXE
+name: Build LumaLink Windows EXE
 
 on:
   push:
     branches: [ main, master ]
     paths:
-      - 'bridge.py'
+      - 'lumalink.py'
       - 'requirements.txt'
       - '.github/workflows/build-pc.yml'
   workflow_dispatch:
@@ -26,12 +26,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt pyinstaller
 
-      - name: Build single EXE
+      - name: Build LumaLink GUI EXE
         run: |
-          pyinstaller --onefile --console --clean --name TuyaBleBridge bridge.py
+          pyinstaller --onefile --windowed --clean --name LumaLink lumalink.py
 
       - name: Upload Windows EXE artifact
         uses: actions/upload-artifact@v4
         with:
-          name: tuya-ble-bridge-windows
-          path: dist/TuyaBleBridge.exe
+          name: LumaLink-Windows
+          path: dist/LumaLink.exe
