@@ -44,9 +44,9 @@ DEFAULT_CONFIG = {
     "local_key": "",
     "device_uuid": "",
     "port": WS_PORT,
-    "protocol_version": 3,
-    "dp_switch": 20,
-    "dp_mode": 21,
+    "protocol_version": 4,
+    "dp_switch": 1,
+    "dp_mode": 2,
     "dp_colour": 24,
     "fps": 14,
     "brightness": 100,
@@ -326,6 +326,9 @@ class LightBridgeSession:
             if offset >= len(chunk):
                 return None
             offset += 1  # байт версии протокола
+        elif self._rx_expected_len == 0:
+            self._rx_buf.clear()
+            return None
 
         self._rx_buf.extend(chunk[offset:])
         if self._rx_expected_len == 0 or len(self._rx_buf) < self._rx_expected_len:
@@ -451,6 +454,54 @@ class LightBridgeSession:
         v_int = int(round(v * 1000 * max(0.05, min(1.0, brightness_scale))))
         hsv_ascii = f"{h_int:04x}{s_int:04x}{v_int:04x}".encode("ascii")
         return self._wrap_dp_command(self._dp_item(dp_id, 0x03, hsv_ascii))
+
+    @staticmethod
+    def parse_dp_payload(code: int, payload: bytes) -> dict:
+        """Парсинг стандартного TLV контейнера Tuya DP."""
+        dps = {}
+        if code in (CODE_RECV_DP_V4, CODE_RECV_TIME_DP_V4):
+            offset = 7
+        elif code in (CODE_RECV_SIGN_DP, CODE_RECV_SIGN_TIME_DP):
+            offset = 4
+        elif code in (CODE_DPS_V4,):
+            offset = 5
+        elif code in (CODE_DPS,):
+            offset = 0
+        else:
+            offset = 0
+
+        while offset < len(payload):
+            if code in (CODE_RECV_DP_V4, CODE_RECV_TIME_DP_V4, CODE_DPS_V4):
+                if offset + 4 > len(payload):
+                    break
+                dp_id, dp_type, val_len = struct.unpack(">BBH", payload[offset : offset + 4])
+                offset += 4
+            else:
+                if offset + 3 > len(payload):
+                    break
+                dp_id, dp_type, val_len = struct.unpack(">BBB", payload[offset : offset + 3])
+                offset += 3
+
+            if offset + val_len > len(payload):
+                break
+            val_data = payload[offset : offset + val_len]
+            offset += val_len
+
+            if dp_type == 0x01:  # Bool
+                dps[dp_id] = bool(val_data[0]) if val_data else False
+            elif dp_type == 0x02:  # Value (4 байта)
+                dps[dp_id] = int.from_bytes(val_data, "big")
+            elif dp_type == 0x04:  # Enum (1 байт)
+                dps[dp_id] = val_data[0] if val_data else 0
+            elif dp_type == 0x03:  # String
+                try:
+                    dps[dp_id] = val_data.decode("utf-8")
+                except Exception:
+                    dps[dp_id] = val_data.hex()
+            else:  # Raw / Bitmap
+                dps[dp_id] = val_data.hex()
+
+        return dps
 
 
 # ==============================================================================
@@ -799,10 +850,44 @@ class BridgeServerController:
                             self._emit("log", text="Лампа приняла DP-команду")
 
                     else:
+                        dps = session.parse_dp_payload(code, payload)
+                        if dps:
+                            mode_names = {0: "White", 1: "Colour", 2: "Scene", 3: "Music"}
+                            dp_desc = []
+                            for dpid, val in dps.items():
+                                if dpid == dp_mode or (dpid in (2, 21) and isinstance(val, int)):
+                                    val_str = f"{val} ({mode_names.get(val, 'Unknown')})"
+                                else:
+                                    val_str = str(val)
+                                dp_desc.append(f"DP{dpid}={val_str}")
+                            self._emit("log", text=f"Отчёт лампы: {', '.join(dp_desc)}")
+
+                            # Автоопределение DP для Tuya BLE ламп:
+                            if 1 in dps and isinstance(dps[1], bool) and dp_switch == 20:
+                                dp_switch = 1
+                                self._emit("log", text="Автоопределение: DP питания скорректирован на 1")
+                            if 2 in dps and isinstance(dps[2], int) and dp_mode == 21:
+                                dp_mode = 2
+                                self._emit("log", text="Автоопределение: DP режима скорректирован на 2")
+
+                            # Если лампа сообщает режим, отличный от Colour (1) — переключаем в Colour
+                            if dp_mode in dps and dps[dp_mode] != 1:
+                                cur_mode_str = mode_names.get(dps[dp_mode], str(dps[dp_mode]))
+                                self._emit(
+                                    "log",
+                                    text=f"Лампа в режиме {cur_mode_str}! Переключаем DP {dp_mode} -> 1 (Colour)...",
+                                )
+                                await self._send_chunks(ws, session.make_dp_enum(dp_mode, 1))
+
+                            # Если лампа сообщает, что выключена — включаем
+                            if dp_switch in dps and dps[dp_switch] is False:
+                                self._emit("log", text=f"Лампа выключена! Включаем питание (DP {dp_switch} -> True)...")
+                                await self._send_chunks(ws, session.make_dp_bool(dp_switch, True))
+
                         reply = session.make_response(code, rx_sn, payload)
                         if reply:
                             await self._send_chunks(ws, reply)
-                        else:
+                        elif not dps:
                             self._emit("log", text=f"Пакет лампы 0x{code:04x}: {payload.hex()}")
 
                 elif msg.type == WSMsgType.ERROR:
@@ -1229,9 +1314,10 @@ class LumaLinkApp:
         self.var_dev_id = tk.StringVar(value=self.cfg.get("device_id", ""))
         self.var_local_key = tk.StringVar(value=self.cfg.get("local_key", ""))
         self.var_uuid = tk.StringVar(value=self.cfg.get("device_uuid", ""))
-        self.var_dp_switch = tk.StringVar(value=str(self.cfg.get("dp_switch", 20)))
+        self.var_dp_switch = tk.StringVar(value=str(self.cfg.get("dp_switch", 1)))
+        self.var_dp_mode = tk.StringVar(value=str(self.cfg.get("dp_mode", 2)))
         self.var_dp_colour = tk.StringVar(value=str(self.cfg.get("dp_colour", 24)))
-        self.var_proto = tk.IntVar(value=int(self.cfg.get("protocol_version", 3)))
+        self.var_proto = tk.IntVar(value=int(self.cfg.get("protocol_version", 4)))
 
         self._add_field(keys_card, "Device ID:", self.var_dev_id)
         self._add_field(keys_card, "Local Key (16 симв.):", self.var_local_key)
@@ -1239,20 +1325,28 @@ class LumaLinkApp:
 
         dp_row = tk.Frame(keys_card, bg=self.BG_CARD)
         dp_row.pack(fill="x", pady=(4, 8))
-        tk.Label(dp_row, text="DP Питание:", font=("Segoe UI", 9), fg=self.TEXT_MUTED, bg=self.BG_CARD).pack(side="left")
+        tk.Label(dp_row, text="DP Вкл:", font=("Segoe UI", 9), fg=self.TEXT_MUTED, bg=self.BG_CARD).pack(side="left")
         ent_sw = tk.Entry(
-            dp_row, textvariable=self.var_dp_switch, width=4, font=("Consolas", 10),
+            dp_row, textvariable=self.var_dp_switch, width=3, font=("Consolas", 10),
             fg=self.TEXT_PRIMARY, bg=self.BG_INPUT, insertbackground=self.TEXT_PRIMARY, bd=0
         )
-        ent_sw.pack(side="left", padx=(4, 10), ipady=3)
+        ent_sw.pack(side="left", padx=(3, 6), ipady=3)
         self._attach_entry_context_menu(ent_sw)
+
+        tk.Label(dp_row, text="DP Режим:", font=("Segoe UI", 9), fg=self.TEXT_MUTED, bg=self.BG_CARD).pack(side="left")
+        ent_mode = tk.Entry(
+            dp_row, textvariable=self.var_dp_mode, width=3, font=("Consolas", 10),
+            fg=self.TEXT_PRIMARY, bg=self.BG_INPUT, insertbackground=self.TEXT_PRIMARY, bd=0
+        )
+        ent_mode.pack(side="left", padx=(3, 6), ipady=3)
+        self._attach_entry_context_menu(ent_mode)
 
         tk.Label(dp_row, text="DP Цвет:", font=("Segoe UI", 9), fg=self.TEXT_MUTED, bg=self.BG_CARD).pack(side="left")
         ent_col = tk.Entry(
-            dp_row, textvariable=self.var_dp_colour, width=4, font=("Consolas", 10),
+            dp_row, textvariable=self.var_dp_colour, width=3, font=("Consolas", 10),
             fg=self.TEXT_PRIMARY, bg=self.BG_INPUT, insertbackground=self.TEXT_PRIMARY, bd=0
         )
-        ent_col.pack(side="left", padx=(4, 12), ipady=3)
+        ent_col.pack(side="left", padx=(3, 8), ipady=3)
         self._attach_entry_context_menu(ent_col)
 
         tk.Label(dp_row, text="Протокол:", font=("Segoe UI", 9), fg=self.TEXT_MUTED, bg=self.BG_CARD).pack(side="left")
@@ -1269,7 +1363,7 @@ class LumaLinkApp:
                 activebackground=self.BG_CARD,
                 activeforeground=self.TEXT_PRIMARY,
                 command=self._push_live_settings,
-            ).pack(side="left", padx=(4, 0))
+            ).pack(side="left", padx=(2, 0))
 
         btn_row = tk.Frame(keys_card, bg=self.BG_CARD)
         btn_row.pack(fill="x", pady=(4, 0))
@@ -1379,9 +1473,10 @@ class LumaLinkApp:
                 "device_id": self.var_dev_id.get().strip(),
                 "local_key": self.var_local_key.get().strip(),
                 "device_uuid": self.var_uuid.get().strip(),
-                "dp_switch": int(self.var_dp_switch.get() or 20),
+                "dp_switch": int(self.var_dp_switch.get() or 1),
+                "dp_mode": int(self.var_dp_mode.get() or 2),
                 "dp_colour": int(self.var_dp_colour.get() or 24),
-                "protocol_version": int(self.var_proto.get() or 3),
+                "protocol_version": int(self.var_proto.get() or 4),
                 "brightness": self.var_brightness.get(),
                 "smoothing": self.var_smoothing.get(),
                 "fps": self.var_fps.get(),
