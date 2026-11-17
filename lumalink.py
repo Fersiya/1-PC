@@ -17,7 +17,6 @@ import traceback
 
 from aiohttp import web, WSMsgType
 from Crypto.Cipher import AES
-from Crypto.Util.Padding import pad, unpad
 import mss
 
 # Включаем четкое масштабирование шрифтов на Windows High-DPI экранах
@@ -104,7 +103,7 @@ def get_local_ips() -> list[str]:
 
 
 # ==============================================================================
-# ПРОТОКОЛ И ШИФРОВАНИЕ КАНАЛА СВЯЗИ С ЛАМПОЙ
+# ПРОТОКОЛ И ШИФРОВАНИЕ КАНАЛА СВЯЗИ С ЛАМПОЙ (TUYA BLE V3 / V4)
 # ==============================================================================
 def crc16_modbus(data: bytes) -> int:
     crc = 0xFFFF
@@ -154,6 +153,7 @@ class LightBridgeSession:
         self.login_key = hashlib.md5(self.local_key[:6]).digest()
         self.session_key: bytes | None = None
         self.sn = 1
+        self.dp_sn = 1
         self.paired = False
 
         self._rx_buf = bytearray()
@@ -162,6 +162,7 @@ class LightBridgeSession:
     def reset(self):
         self.session_key = None
         self.sn = 1
+        self.dp_sn = 1
         self.paired = False
         self._rx_buf.clear()
         self._rx_expected_len = 0
@@ -177,6 +178,10 @@ class LightBridgeSession:
         crc = crc16_modbus(raw)
         raw_with_crc = raw + struct.pack(">H", crc)
 
+        # Протокол Tuya BLE использует дополнение нулями (zero-padding) до 16 байт
+        pad_len = (16 - (len(raw_with_crc) % 16)) % 16
+        padded = raw_with_crc + (b"\x00" * pad_len)
+
         if use_session and self.session_key:
             sec_flag = 0x04
             key = self.session_key
@@ -186,7 +191,7 @@ class LightBridgeSession:
 
         iv = os.urandom(16)
         cipher = AES.new(key, AES.MODE_CBC, iv)
-        encrypted = bytes([sec_flag]) + iv + cipher.encrypt(pad(raw_with_crc, 16))
+        encrypted = bytes([sec_flag]) + iv + cipher.encrypt(padded)
 
         chunks = []
         pack_num = 0
@@ -208,10 +213,14 @@ class LightBridgeSession:
         return chunks
 
     def feed_ble_chunk(self, chunk: bytes) -> tuple[int, int, bytes] | None:
+        if not chunk:
+            return None
         pack_num, offset = unpack_varint(chunk, 0)
         if pack_num == 0:
             self._rx_buf.clear()
             self._rx_expected_len, offset = unpack_varint(chunk, offset)
+            if offset >= len(chunk):
+                return None
             _proto_ver = chunk[offset]
             offset += 1
 
@@ -223,15 +232,24 @@ class LightBridgeSession:
         self._rx_buf.clear()
         self._rx_expected_len = 0
 
+        if len(encrypted) < 33:
+            raise ValueError(f"Пакет BLE слишком короткий ({len(encrypted)} байт)")
+
         sec_flag = encrypted[0]
         iv = encrypted[1:17]
         ciphertext = encrypted[17:]
+        if len(ciphertext) % 16 != 0:
+            ciphertext = ciphertext[: (len(ciphertext) // 16) * 16]
+
         key = self.session_key if (sec_flag == 0x04 and self.session_key) else self.login_key
 
         cipher = AES.new(key, AES.MODE_CBC, iv)
-        decrypted = unpad(cipher.decrypt(ciphertext), 16)
+        decrypted = cipher.decrypt(ciphertext)
 
         sn, ack_sn, code, data_len = struct.unpack(">IIHH", decrypted[:12])
+        if 12 + data_len > len(decrypted):
+            raise ValueError(f"Ошибка расшифровки пакета (code=0x{code:04x}, len={data_len})")
+
         payload = decrypted[12 : 12 + data_len]
         return sn, code, payload
 
@@ -239,14 +257,26 @@ class LightBridgeSession:
         return self._build_encrypted_frame(code=0x0000, data=b"", use_session=False)
 
     def handle_device_info_resp(self, payload: bytes) -> list[bytes]:
+        if len(payload) < 12:
+            raise ValueError(f"Короткий ответ Device Info ({len(payload)} байт)")
+        if payload[2] in (2, 3, 4):
+            self.protocol_version = payload[2]
         srand = payload[6:12]
         self.session_key = hashlib.md5(self.local_key[:6] + srand).digest()
         pair_payload = self.uuid + self.local_key[:6] + self.device_id.ljust(16, b"\x00")
         return self._build_encrypted_frame(code=0x0001, data=pair_payload, use_session=True)
 
+    def _wrap_dp_command(self, dp_packet: bytes) -> list[bytes]:
+        if self.protocol_version >= 4:
+            sn = self.dp_sn
+            self.dp_sn += 1
+            v4_data = struct.pack(">IB", sn, 0x00) + dp_packet
+            return self._build_encrypted_frame(code=0x0027, data=v4_data, use_session=True)
+        return self._build_encrypted_frame(code=0x0002, data=dp_packet, use_session=True)
+
     def make_dp_bool(self, dp_id: int, value: bool) -> list[bytes]:
         dp_packet = struct.pack(">BBH", dp_id, 0x01, 1) + (b"\x01" if value else b"\x00")
-        return self._build_encrypted_frame(code=0x0002, data=dp_packet, use_session=True)
+        return self._wrap_dp_command(dp_packet)
 
     def make_dp_color_hsv(
         self, dp_id: int, r: int, g: int, b: int, brightness_scale: float
@@ -257,7 +287,7 @@ class LightBridgeSession:
         v_int = int(round(v * 1000 * max(0.05, min(1.0, brightness_scale))))
         hsv_ascii = f"{h_int:04x}{s_int:04x}{v_int:04x}".encode("ascii")
         dp_packet = struct.pack(">BBH", dp_id, 0x03, len(hsv_ascii)) + hsv_ascii
-        return self._build_encrypted_frame(code=0x0002, data=dp_packet, use_session=True)
+        return self._wrap_dp_command(dp_packet)
 
 
 # ==============================================================================
@@ -271,13 +301,11 @@ def capture_screen_rgb(mode: str = "fullscreen") -> tuple[int, int, int]:
         w, h = img.width, img.height
 
         if mode == "edges":
-            # Берем верхнюю и боковые кромки экрана (классический Ambilight)
             step = 12
             r_sum = g_sum = b_sum = count = 0
             top_h = max(1, h // 6)
             side_w = max(1, w // 7)
 
-            # Верхняя полоса
             for y in range(0, top_h, step):
                 row_off = y * w * 3
                 for x in range(0, w, step):
@@ -287,7 +315,6 @@ def capture_screen_rgb(mode: str = "fullscreen") -> tuple[int, int, int]:
                     b_sum += raw[idx + 2]
                     count += 1
 
-            # Левая и правая полосы ниже верхней
             for y in range(top_h, h, step):
                 row_off = y * w * 3
                 for x in range(0, side_w, step):
@@ -442,7 +469,7 @@ class BridgeServerController:
             await asyncio.sleep(max(0.01, (1.0 / fps) - elapsed))
 
     async def _ws_handler(self, request: web.Request):
-        ws = web.WebSocketResponse()
+        ws = web.WebSocketResponse(heartbeat=20.0)
         await ws.prepare(request)
 
         snap = self.get_cfg_snapshot()
@@ -460,7 +487,7 @@ class BridgeServerController:
                     data = json.loads(msg.data)
                     if data.get("type") == "ble_connected":
                         session.reset()
-                        self._emit("log", text="Лампа найдена, запускаем авторизацию...")
+                        self._emit("log", text="Лампа найдена, запрос параметров чипа...")
                         await self._send_chunks(ws, session.make_device_info_req())
 
                     elif data.get("type") == "ble_disconnected":
@@ -478,6 +505,7 @@ class BridgeServerController:
                     _sn, code, payload = parsed
 
                     if code == 0x0000:
+                        self._emit("log", text=f"Ответ чипа получен (proto v{payload[2] if len(payload) > 2 else '?'}), отправка Pair...")
                         await ws.send_str(json.dumps({"log": "Обмен ключами..."}))
                         await self._send_chunks(ws, session.handle_device_info_resp(payload))
 
@@ -504,6 +532,16 @@ class BridgeServerController:
                             self._emit("log", text=err_msg)
                             await ws.send_str(json.dumps({"status": err_msg, "log": err_msg}))
 
+                elif msg.type == WSMsgType.ERROR:
+                    self._emit("log", text=f"Ошибка WebSocket: {ws.exception()}")
+
+        except Exception as e:
+            err_text = f"Сбой сессии: {e}"
+            self._emit("log", text=err_text)
+            try:
+                await ws.send_str(json.dumps({"status": err_text}))
+            except Exception:
+                pass
         finally:
             if stream_task:
                 stream_task.cancel()
@@ -567,7 +605,6 @@ class LumaLinkApp:
         self._build_ui()
         self._poll_queue()
 
-        # Если ключи уже заполнены — стартуем сервер автоматически
         if self._is_config_valid(silent=True):
             self.controller.start()
 
@@ -600,11 +637,9 @@ class LumaLinkApp:
             sliderlength=18,
         )
 
-        # Главный скроллируемый контейнер
         container = tk.Frame(self.root, bg=self.BG_MAIN, padx=20, pady=16)
         container.pack(fill="both", expand=True)
 
-        # --- ШАПКА ---
         header = tk.Frame(container, bg=self.BG_MAIN)
         header.pack(fill="x", pady=(0, 12))
 
@@ -638,13 +673,11 @@ class LumaLinkApp:
         )
         self.server_badge.pack(side="right", anchor="center")
 
-        # --- КАРТОЧКА ЖИВОГО ЦВЕТА И IP ---
         hero_card = tk.Frame(
             container, bg=self.BG_CARD, highlightbackground=self.BORDER, highlightthickness=1, padx=16, pady=14
         )
         hero_card.pack(fill="x", pady=(0, 12))
 
-        # Круглый индикатор цвета
         self.color_canvas = tk.Canvas(
             hero_card, width=78, height=78, bg=self.BG_CARD, highlightthickness=0
         )
@@ -705,7 +738,6 @@ class LumaLinkApp:
         )
         btn_copy.pack(side="left", padx=(6, 0))
 
-        # --- КАРТОЧКА УПРАВЛЕНИЯ ПОДСВЕТКОЙ ---
         ctrl_card = tk.Frame(
             container, bg=self.BG_CARD, highlightbackground=self.BORDER, highlightthickness=1, padx=16, pady=14
         )
@@ -755,7 +787,6 @@ class LumaLinkApp:
             )
             rb.pack(side="left", padx=(12, 0))
 
-        # --- КАРТОЧКА КЛЮЧЕЙ ЛАМПЫ ---
         keys_card = tk.Frame(
             container, bg=self.BG_CARD, highlightbackground=self.BORDER, highlightthickness=1, padx=16, pady=14
         )
@@ -831,7 +862,6 @@ class LumaLinkApp:
         )
         btn_save.pack(side="left", padx=(10, 0))
 
-        # --- КОМПАКТНЫЙ ЖУРНАЛ СОБЫТИЙ ---
         log_card = tk.Frame(
             container, bg=self.BG_CARD, highlightbackground=self.BORDER, highlightthickness=1, padx=12, pady=10
         )
