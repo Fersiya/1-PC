@@ -13,7 +13,6 @@ import threading
 import time
 import tkinter as tk
 from tkinter import messagebox, ttk
-import traceback
 
 from aiohttp import web, WSMsgType
 from Crypto.Cipher import AES
@@ -39,7 +38,7 @@ DEFAULT_CONFIG = {
     "local_key": "",
     "device_uuid": "",
     "port": WS_PORT,
-    "protocol_version": 3,
+    "protocol_version": 4,
     "dp_switch": 20,
     "dp_colour": 24,
     "fps": 14,
@@ -103,7 +102,7 @@ def get_local_ips() -> list[str]:
 
 
 # ==============================================================================
-# ПРОТОКОЛ И ШИФРОВАНИЕ КАНАЛА СВЯЗИ С ЛАМПОЙ (TUYA BLE V3 / V4)
+# ПРОТОКОЛ И ШИФРОВАНИЕ КАНАЛА СВЯЗИ С ЛАМПОЙ (TUYA BLE V4 / V3)
 # ==============================================================================
 def crc16_modbus(data: bytes) -> int:
     crc = 0xFFFF
@@ -148,7 +147,7 @@ class LightBridgeSession:
         self.device_id = cfg["device_id"].strip().encode("utf-8")[:16]
         self.local_key = cfg["local_key"].strip().encode("utf-8")
         self.uuid = cfg["device_uuid"].strip().encode("utf-8")[:16]
-        self.protocol_version = int(cfg.get("protocol_version", 3))
+        self.protocol_version = int(cfg.get("protocol_version", 4))
 
         self.login_key = hashlib.md5(self.local_key[:6]).digest()
         self.session_key: bytes | None = None
@@ -159,7 +158,9 @@ class LightBridgeSession:
         self._rx_buf = bytearray()
         self._rx_expected_len = 0
 
-    def reset(self):
+    def reset(self, protocol_version: int | None = None):
+        if protocol_version is not None:
+            self.protocol_version = protocol_version
         self.session_key = None
         self.sn = 1
         self.dp_sn = 1
@@ -178,7 +179,6 @@ class LightBridgeSession:
         crc = crc16_modbus(raw)
         raw_with_crc = raw + struct.pack(">H", crc)
 
-        # Протокол Tuya BLE использует дополнение нулями (zero-padding) до 16 байт
         pad_len = (16 - (len(raw_with_crc) % 16)) % 16
         padded = raw_with_crc + (b"\x00" * pad_len)
 
@@ -486,8 +486,9 @@ class BridgeServerController:
                 if msg.type == WSMsgType.TEXT:
                     data = json.loads(msg.data)
                     if data.get("type") == "ble_connected":
-                        session.reset()
-                        self._emit("log", text="Лампа найдена, запрос параметров чипа...")
+                        cur_proto = int(self.get_cfg_snapshot().get("protocol_version", 4))
+                        session.reset(protocol_version=cur_proto)
+                        self._emit("log", text=f"Канал BLE готов -> отправка запроса (протокол v{cur_proto})...")
                         await self._send_chunks(ws, session.make_device_info_req())
 
                     elif data.get("type") == "ble_disconnected":
@@ -498,6 +499,7 @@ class BridgeServerController:
                         self._emit("log", text="Лампа отключилась от телефона")
 
                 elif msg.type == WSMsgType.BINARY:
+                    self._emit("log", text=f"BLE RX ({len(msg.data)} байт): {msg.data.hex()}")
                     parsed = session.feed_ble_chunk(msg.data)
                     if not parsed:
                         continue
@@ -505,7 +507,8 @@ class BridgeServerController:
                     _sn, code, payload = parsed
 
                     if code == 0x0000:
-                        self._emit("log", text=f"Ответ чипа получен (proto v{payload[2] if len(payload) > 2 else '?'}), отправка Pair...")
+                        ver = payload[2] if len(payload) > 2 else "?"
+                        self._emit("log", text=f"Ответ чипа получен (v{ver}), отправка Pair...")
                         await ws.send_str(json.dumps({"log": "Обмен ключами..."}))
                         await self._send_chunks(ws, session.handle_device_info_resp(payload))
 
@@ -592,8 +595,8 @@ class LumaLinkApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title(f"{APP_NAME} — {APP_SUBTITLE}")
-        self.root.geometry("560x760")
-        self.root.minsize(520, 700)
+        self.root.geometry("560x790")
+        self.root.minsize(520, 720)
         self.root.configure(bg=self.BG_MAIN)
 
         self.cfg = load_config()
@@ -808,6 +811,7 @@ class LumaLinkApp:
         self.var_uuid = tk.StringVar(value=self.cfg.get("device_uuid", ""))
         self.var_dp_switch = tk.StringVar(value=str(self.cfg.get("dp_switch", 20)))
         self.var_dp_colour = tk.StringVar(value=str(self.cfg.get("dp_colour", 24)))
+        self.var_proto = tk.IntVar(value=int(self.cfg.get("protocol_version", 4)))
 
         self._add_field(keys_card, "Device ID:", self.var_dev_id)
         self._add_field(keys_card, "Local Key (16 симв.):", self.var_local_key)
@@ -817,15 +821,31 @@ class LumaLinkApp:
         dp_row.pack(fill="x", pady=(4, 8))
         tk.Label(dp_row, text="DP Питание:", font=("Segoe UI", 9), fg=self.TEXT_MUTED, bg=self.BG_CARD).pack(side="left")
         tk.Entry(
-            dp_row, textvariable=self.var_dp_switch, width=5, font=("Consolas", 10),
+            dp_row, textvariable=self.var_dp_switch, width=4, font=("Consolas", 10),
             fg=self.TEXT_PRIMARY, bg=self.BG_INPUT, insertbackground=self.TEXT_PRIMARY, bd=0
-        ).pack(side="left", padx=(6, 16), ipady=3)
+        ).pack(side="left", padx=(4, 10), ipady=3)
 
         tk.Label(dp_row, text="DP Цвет:", font=("Segoe UI", 9), fg=self.TEXT_MUTED, bg=self.BG_CARD).pack(side="left")
         tk.Entry(
-            dp_row, textvariable=self.var_dp_colour, width=5, font=("Consolas", 10),
+            dp_row, textvariable=self.var_dp_colour, width=4, font=("Consolas", 10),
             fg=self.TEXT_PRIMARY, bg=self.BG_INPUT, insertbackground=self.TEXT_PRIMARY, bd=0
-        ).pack(side="left", padx=(6, 0), ipady=3)
+        ).pack(side="left", padx=(4, 12), ipady=3)
+
+        tk.Label(dp_row, text="Протокол:", font=("Segoe UI", 9), fg=self.TEXT_MUTED, bg=self.BG_CARD).pack(side="left")
+        for p_val, p_lbl in [(4, "v4 (FD50)"), (3, "v3")]:
+            tk.Radiobutton(
+                dp_row,
+                text=p_lbl,
+                variable=self.var_proto,
+                value=p_val,
+                font=("Segoe UI", 9),
+                fg=self.TEXT_PRIMARY,
+                bg=self.BG_CARD,
+                selectcolor=self.BG_INPUT,
+                activebackground=self.BG_CARD,
+                activeforeground=self.TEXT_PRIMARY,
+                command=self._push_live_settings,
+            ).pack(side="left", padx=(4, 0))
 
         btn_row = tk.Frame(keys_card, bg=self.BG_CARD)
         btn_row.pack(fill="x", pady=(4, 0))
@@ -869,7 +889,7 @@ class LumaLinkApp:
 
         self.log_text = tk.Text(
             log_card,
-            height=5,
+            height=6,
             font=("Consolas", 9),
             fg=self.TEXT_MUTED,
             bg=self.BG_CARD,
@@ -935,6 +955,7 @@ class LumaLinkApp:
                 "device_uuid": self.var_uuid.get().strip(),
                 "dp_switch": int(self.var_dp_switch.get() or 20),
                 "dp_colour": int(self.var_dp_colour.get() or 24),
+                "protocol_version": int(self.var_proto.get() or 4),
                 "brightness": self.var_brightness.get(),
                 "smoothing": self.var_smoothing.get(),
                 "fps": self.var_fps.get(),
