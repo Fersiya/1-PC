@@ -511,14 +511,14 @@ class BridgeServerController:
 
         # Перебираем все варианты кадров Tuya BLE за 10 секунд до получения ответа
         probes = [
-            (pref_ver, 1, 20, f"v{pref_ver} key1 20B"),
-            (pref_ver, 1, full_chunk, f"v{pref_ver} key1 MTU"),
-            (alt_ver, 1, 20, f"v{alt_ver} key1 20B"),
-            (alt_ver, 1, full_chunk, f"v{alt_ver} key1 MTU"),
+            (4, 2, 20, "v4 uuid-key 20B"),
+            (4, 1, 20, "v4 key1 20B"),
+            (3, 2, 20, "v3 uuid-key 20B"),
+            (3, 1, 20, "v3 key1 20B"),
+            (4, 0, 20, "v4 plain 20B"),
+            (3, 0, 20, "v3 plain 20B"),
+            (4, 1, full_chunk, "v4 key1 MTU"),
             (2, 1, 20, "v2 key1 20B"),
-            (pref_ver, 0, 20, f"v{pref_ver} plain 20B"),
-            (alt_ver, 0, 20, f"v{alt_ver} plain 20B"),
-            (alt_ver, 2, 20, f"v{alt_ver} uuid-key 20B"),
         ]
 
         for p_ver, s_mode, c_size, label in probes:
@@ -598,6 +598,21 @@ class BridgeServerController:
                         probe_task = asyncio.create_task(
                             self._handshake_probe_loop(ws, session, mtu)
                         )
+
+                    elif data.get("type") == "ble_gatt_dump":
+                        adv_hex = data.get("adv", "")
+                        reads = data.get("reads", {})
+                        gatt_list = data.get("gatt", [])
+                        self._emit("log", text=f"GATT дамп ({data.get('mac')}): сервисов={len(gatt_list)}")
+                        for s in gatt_list:
+                            c_desc = ", ".join(
+                                f"{c['uuid'][4:8]}(p={c['props']})" for c in s.get("chars", [])
+                            )
+                            self._emit("log", text=f"  Сервис {s['uuid'][4:8]}: {c_desc}")
+                        for k, v in reads.items():
+                            self._emit("log", text=f"  Read {k[4:8]}: {v}")
+                        if adv_hex:
+                            self._emit("log", text=f"  Adv: {adv_hex[:64]}")
 
                     elif data.get("type") == "ble_tx_err":
                         self._emit(
