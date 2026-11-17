@@ -44,8 +44,9 @@ DEFAULT_CONFIG = {
     "local_key": "",
     "device_uuid": "",
     "port": WS_PORT,
-    "protocol_version": 4,
+    "protocol_version": 3,
     "dp_switch": 20,
+    "dp_mode": 21,
     "dp_colour": 24,
     "fps": 14,
     "brightness": 100,
@@ -181,21 +182,65 @@ def unpack_varint(buf: bytes, offset: int = 0) -> tuple[int, int]:
     return val, offset
 
 
+SEC_AUTH = 0x01  # ключ auth_key из Device Info (только для разбора входящих)
+SEC_LOGIN = 0x04  # login_key = md5(local_key[:6]) — только запрос Device Info
+SEC_SESSION = 0x05  # session_key = md5(local_key[:6] + srand) — всё остальное
+
+CODE_DEVICE_INFO = 0x0000
+CODE_PAIR = 0x0001
+CODE_DPS = 0x0002
+CODE_DPS_V4 = 0x0027
+CODE_RECV_DP = 0x8001
+CODE_RECV_TIME_DP = 0x8003
+CODE_RECV_SIGN_DP = 0x8004
+CODE_RECV_SIGN_TIME_DP = 0x8005
+CODE_RECV_TIME1_REQ = 0x8011
+CODE_RECV_TIME2_REQ = 0x8012
+
+TUYA_COMPANY_ID = 0x07D0
+
+
+def parse_adv_protocol(adv_hex: str) -> int | None:
+    """Версия протокола Tuya BLE из рекламного пакета (manufacturer data, company id 0x07D0)."""
+    try:
+        raw = bytes.fromhex(adv_hex)
+    except ValueError:
+        return None
+    pos = 0
+    while pos < len(raw):
+        ln = raw[pos]
+        if ln == 0 or pos + 1 + ln > len(raw):
+            break
+        ad_type = raw[pos + 1]
+        body = raw[pos + 2 : pos + 1 + ln]
+        if (
+            ad_type == 0xFF
+            and len(body) >= 4
+            and int.from_bytes(body[0:2], "little") == TUYA_COMPANY_ID
+        ):
+            return body[3] if body[3] in (2, 3, 4) else None
+        pos += 1 + ln
+    return None
+
+
 class LightBridgeSession:
+    """Сессия Tuya BLE: Device Info (login_key, флаг 4) -> Pair и DP (session_key, флаг 5)."""
+
     def __init__(self, cfg: dict):
-        self.device_id = cfg["device_id"].strip().encode("utf-8")[:16]
-        self.local_key = cfg["local_key"].strip().encode("utf-8")
+        self.device_id = cfg["device_id"].strip().encode("utf-8")[:22]
+        self.local_key = cfg["local_key"].strip().encode("utf-8")[:6]
         self.uuid = cfg["device_uuid"].strip().encode("utf-8")[:16]
-        self.protocol_version = int(cfg.get("protocol_version", 4))
+        self.protocol_version = int(cfg.get("protocol_version", 3))
         self.chunk_size = 20
 
-        self.login_key = hashlib.md5(self.local_key[:6]).digest()
-        self.uuid_key = hashlib.md5(self.uuid).digest()
+        self.login_key = hashlib.md5(self.local_key).digest()
         self.session_key: bytes | None = None
+        self.auth_key: bytes | None = None
         self.sn = 1
         self.dp_sn = 1
         self.paired = False
         self.handshake_replied = False
+        self.is_bound = False
 
         self._rx_buf = bytearray()
         self._rx_expected_len = 0
@@ -205,6 +250,7 @@ class LightBridgeSession:
             self.protocol_version = protocol_version
         self.chunk_size = max(20, min(240, int(chunk_size)))
         self.session_key = None
+        self.auth_key = None
         self.sn = 1
         self.dp_sn = 1
         self.paired = False
@@ -217,39 +263,28 @@ class LightBridgeSession:
         code: int,
         data: bytes,
         ack_sn: int = 0,
-        sec_mode: int = 1,
         proto_ver: int | None = None,
         chunk_size: int | None = None,
     ) -> list[bytes]:
+        if code == CODE_DEVICE_INFO:
+            key, sec_flag = self.login_key, SEC_LOGIN
+        else:
+            if not self.session_key:
+                raise ValueError("Нет session-ключа: сначала нужен ответ Device Info")
+            key, sec_flag = self.session_key, SEC_SESSION
+
         sn = self.sn
         self.sn += 1
 
         ver = proto_ver if proto_ver is not None else self.protocol_version
         max_pkt = chunk_size if chunk_size is not None else self.chunk_size
 
-        header = struct.pack(">IIHH", sn, ack_sn, code, len(data))
-        raw = header + data
-        crc = crc16_modbus(raw)
-        raw_with_crc = raw + struct.pack(">H", crc)
+        raw = struct.pack(">IIHH", sn, ack_sn, code, len(data)) + data
+        raw += struct.pack(">H", crc16_modbus(raw))
+        raw += b"\x00" * ((16 - len(raw) % 16) % 16)
 
-        if sec_mode == 0:
-            # Нешифрованный заголовок sec_flag=0x00
-            payload_wire = b"\x00" + raw_with_crc
-        else:
-            pad_len = (16 - (len(raw_with_crc) % 16)) % 16
-            padded = raw_with_crc + (b"\x00" * pad_len)
-
-            if sec_mode == 4 and self.session_key:
-                key = self.session_key
-            elif sec_mode == 2:
-                key = self.uuid_key
-            else:
-                sec_mode = 1
-                key = self.login_key
-
-            iv = os.urandom(16)
-            cipher = AES.new(key, AES.MODE_CBC, iv)
-            payload_wire = bytes([sec_mode]) + iv + cipher.encrypt(padded)
+        iv = os.urandom(16)
+        payload_wire = bytes([sec_flag]) + iv + AES.new(key, AES.MODE_CBC, iv).encrypt(raw)
 
         chunks = []
         pack_num = 0
@@ -271,6 +306,7 @@ class LightBridgeSession:
         return chunks
 
     def feed_ble_chunk(self, chunk: bytes) -> tuple[int, int, bytes] | None:
+        """Собирает пакет из BLE-чанков. Возвращает (sn, code, payload) или None, если пакет не полон."""
         if not chunk:
             return None
         pack_num, offset = unpack_varint(chunk, 0)
@@ -279,8 +315,7 @@ class LightBridgeSession:
             self._rx_expected_len, offset = unpack_varint(chunk, offset)
             if offset >= len(chunk):
                 return None
-            _proto_ver = chunk[offset]
-            offset += 1
+            offset += 1  # байт версии протокола
 
         self._rx_buf.extend(chunk[offset:])
         if self._rx_expected_len == 0 or len(self._rx_buf) < self._rx_expected_len:
@@ -291,41 +326,47 @@ class LightBridgeSession:
         self._rx_expected_len = 0
 
         sec_flag = wire[0]
-        if sec_flag == 0x00:
-            decrypted = wire[1:]
+        if len(wire) < 33:
+            raise ValueError(f"Пакет BLE слишком короткий ({len(wire)} байт)")
+
+        if sec_flag == SEC_LOGIN:
+            key = self.login_key
+        elif sec_flag == SEC_SESSION:
+            key = self.session_key
+        elif sec_flag == SEC_AUTH:
+            key = self.auth_key
         else:
-            if len(wire) < 33:
-                raise ValueError(f"Пакет BLE слишком короткий ({len(wire)} байт)")
-            iv = wire[1:17]
-            ciphertext = wire[17:]
-            if len(ciphertext) % 16 != 0:
-                ciphertext = ciphertext[: (len(ciphertext) // 16) * 16]
+            raise ValueError(f"Неизвестный флаг шифрования 0x{sec_flag:02x}")
+        if key is None:
+            raise ValueError(f"Нет ключа для флага шифрования 0x{sec_flag:02x}")
 
-            if sec_flag == 0x04 and self.session_key:
-                key = self.session_key
-            elif sec_flag == 0x02:
-                key = self.uuid_key
-            else:
-                key = self.login_key
+        iv = wire[1:17]
+        ciphertext = wire[17:]
+        ciphertext = ciphertext[: (len(ciphertext) // 16) * 16]
+        decrypted = AES.new(key, AES.MODE_CBC, iv).decrypt(ciphertext)
 
-            cipher = AES.new(key, AES.MODE_CBC, iv)
-            decrypted = cipher.decrypt(ciphertext)
+        sn, _ack_sn, code, data_len = struct.unpack(">IIHH", decrypted[:12])
+        end = 12 + data_len
+        if end + 2 > len(decrypted):
+            raise ValueError(
+                f"Ошибка расшифровки (code=0x{code:04x}, len={data_len}) — проверьте Local Key"
+            )
+        (crc_rx,) = struct.unpack(">H", decrypted[end : end + 2])
+        if crc_rx != crc16_modbus(decrypted[:end]):
+            raise ValueError(
+                f"CRC пакета не совпал (code=0x{code:04x}) — проверьте Local Key"
+            )
 
-        sn, ack_sn, code, data_len = struct.unpack(">IIHH", decrypted[:12])
-        if 12 + data_len > len(decrypted):
-            raise ValueError(f"Ошибка расшифровки пакета (code=0x{code:04x}, len={data_len})")
+        return sn, code, decrypted[12:end]
 
-        payload = decrypted[12 : 12 + data_len]
-        return sn, code, payload
-
-    def make_probe_req(self, proto_ver: int, sec_mode: int, chunk_size: int) -> list[bytes]:
+    def make_probe_req(self, proto_ver: int, chunk_size: int) -> list[bytes]:
+        """Запрос Device Info (login_key, флаг 4) с заданной версией протокола в заголовке."""
         self.protocol_version = proto_ver
         self.chunk_size = chunk_size
         self.sn = 1
         return self._build_frame(
-            code=0x0000,
+            code=CODE_DEVICE_INFO,
             data=b"",
-            sec_mode=sec_mode,
             proto_ver=proto_ver,
             chunk_size=chunk_size,
         )
@@ -335,22 +376,56 @@ class LightBridgeSession:
             raise ValueError(f"Короткий ответ Device Info ({len(payload)} байт)")
         if payload[2] in (2, 3, 4):
             self.protocol_version = payload[2]
+        self.is_bound = payload[5] != 0
         srand = payload[6:12]
-        self.session_key = hashlib.md5(self.local_key[:6] + srand).digest()
-        pair_payload = self.uuid + self.local_key[:6] + self.device_id.ljust(16, b"\x00")
-        return self._build_frame(code=0x0001, data=pair_payload, sec_mode=4)
+        self.session_key = hashlib.md5(self.local_key + srand).digest()
+        if len(payload) >= 46:
+            self.auth_key = payload[14:46]
+        # uuid(16) + local_key(6) + device_id, весь пакет добивается нулями до 44 байт
+        pair_payload = (self.uuid + self.local_key + self.device_id).ljust(44, b"\x00")
+        return self._build_frame(code=CODE_PAIR, data=pair_payload)
+
+    def make_response(self, code: int, ack_sn: int, payload: bytes = b"") -> list[bytes] | None:
+        """Ответ на входящую команду лампы (запрос времени, отчёты DP)."""
+        if code == CODE_RECV_TIME1_REQ:
+            tz = -int(time.timezone / 36)
+            data = str(int(time.time() * 1000)).encode() + struct.pack(">h", tz)
+        elif code == CODE_RECV_TIME2_REQ:
+            t = time.localtime()
+            tz = -int(time.timezone / 36)
+            data = struct.pack(
+                ">BBBBBBBh",
+                t.tm_year % 100, t.tm_mon, t.tm_mday,
+                t.tm_hour, t.tm_min, t.tm_sec, t.tm_wday, tz,
+            )
+        elif code in (CODE_RECV_DP, CODE_RECV_TIME_DP):
+            data = b""
+        elif code in (CODE_RECV_SIGN_DP, CODE_RECV_SIGN_TIME_DP) and len(payload) >= 3:
+            data = payload[:2] + bytes([payload[2], 0])
+        else:
+            return None
+        return self._build_frame(code=code, data=data, ack_sn=ack_sn)
+
+    def _dp_item(self, dp_id: int, dp_type: int, value: bytes) -> bytes:
+        # Tuya BLE v3 (проверено по ha_tuya_ble): длина значения — 1 байт.
+        # Для v4 формат оставлен прежним (2 байта), в эталоне он не реализован.
+        if self.protocol_version >= 4:
+            return struct.pack(">BBH", dp_id, dp_type, len(value)) + value
+        return struct.pack(">BBB", dp_id, dp_type, len(value)) + value
 
     def _wrap_dp_command(self, dp_packet: bytes) -> list[bytes]:
         if self.protocol_version >= 4:
             sn = self.dp_sn
             self.dp_sn += 1
             v4_data = struct.pack(">IB", sn, 0x00) + dp_packet
-            return self._build_frame(code=0x0027, data=v4_data, sec_mode=4)
-        return self._build_frame(code=0x0002, data=dp_packet, sec_mode=4)
+            return self._build_frame(code=CODE_DPS_V4, data=v4_data)
+        return self._build_frame(code=CODE_DPS, data=dp_packet)
 
     def make_dp_bool(self, dp_id: int, value: bool) -> list[bytes]:
-        dp_packet = struct.pack(">BBH", dp_id, 0x01, 1) + (b"\x01" if value else b"\x00")
-        return self._wrap_dp_command(dp_packet)
+        return self._wrap_dp_command(self._dp_item(dp_id, 0x01, b"\x01" if value else b"\x00"))
+
+    def make_dp_enum(self, dp_id: int, value: int) -> list[bytes]:
+        return self._wrap_dp_command(self._dp_item(dp_id, 0x04, bytes([value & 0xFF])))
 
     def make_dp_color_hsv(
         self, dp_id: int, r: int, g: int, b: int, brightness_scale: float
@@ -360,8 +435,7 @@ class LightBridgeSession:
         s_int = int(round(s * 1000))
         v_int = int(round(v * 1000 * max(0.05, min(1.0, brightness_scale))))
         hsv_ascii = f"{h_int:04x}{s_int:04x}{v_int:04x}".encode("ascii")
-        dp_packet = struct.pack(">BBH", dp_id, 0x03, len(hsv_ascii)) + hsv_ascii
-        return self._wrap_dp_command(dp_packet)
+        return self._wrap_dp_command(self._dp_item(dp_id, 0x03, hsv_ascii))
 
 
 # ==============================================================================
@@ -503,34 +577,46 @@ class BridgeServerController:
             await ws.send_bytes(chunk)
 
     async def _handshake_probe_loop(
-        self, ws: web.WebSocketResponse, session: LightBridgeSession, mtu: int
+        self,
+        ws: web.WebSocketResponse,
+        session: LightBridgeSession,
+        mtu: int,
+        adv_ver: int | None = None,
     ):
         full_chunk = max(20, min(240, mtu - 3))
-        pref_ver = int(self.get_cfg_snapshot().get("protocol_version", 4))
-        alt_ver = 3 if pref_ver == 4 else 4
+        pref_ver = adv_ver or int(self.get_cfg_snapshot().get("protocol_version", 3))
 
-        # Перебираем все варианты кадров Tuya BLE за 10 секунд до получения ответа
-        probes = [
-            (4, 2, 20, "v4 uuid-key 20B"),
-            (4, 1, 20, "v4 key1 20B"),
-            (3, 2, 20, "v3 uuid-key 20B"),
-            (3, 1, 20, "v3 key1 20B"),
-            (4, 0, 20, "v4 plain 20B"),
-            (3, 0, 20, "v3 plain 20B"),
-            (4, 1, full_chunk, "v4 key1 MTU"),
-            (2, 1, 20, "v2 key1 20B"),
-        ]
+        # Запрос Device Info всегда идёт с login_key (флаг 0x04); перебираем только
+        # версию протокола в заголовке и размер чанка.
+        versions: list[int] = []
+        for v in (pref_ver, 3, 2, 4):
+            if v not in versions:
+                versions.append(v)
+        probes = [(v, 20, f"v{v}, чанк 20 Б") for v in versions]
+        if full_chunk > 20:
+            probes.append((pref_ver, full_chunk, f"v{pref_ver}, чанк {full_chunk} Б"))
 
-        for p_ver, s_mode, c_size, label in probes:
+        for p_ver, c_size, label in probes:
             if ws.closed or session.handshake_replied or self._stop_event.is_set():
                 return
-            chunks = session.make_probe_req(p_ver, s_mode, c_size)
-            self._emit("log", text=f"Автоподбор BLE -> проба [{label}] ({len(chunks)} пак.)")
+            chunks = session.make_probe_req(p_ver, c_size)
+            self._emit("log", text=f"Запрос Device Info [{label}] ({len(chunks)} пак.)")
             try:
                 await self._send_chunks(ws, chunks)
             except Exception:
                 return
-            await asyncio.sleep(1.35)
+            await asyncio.sleep(1.5)
+
+        if not (ws.closed or session.handshake_replied):
+            hint = (
+                "Лампа не отвечает на рукопожатие. Закройте Smart Life/Tuya на телефоне "
+                "(у лампы одно BLE-соединение) и проверьте, что это Tuya-лампа."
+            )
+            self._emit("log", text=hint)
+            try:
+                await ws.send_str(json.dumps({"status": hint}))
+            except Exception:
+                pass
 
     async def _ambilight_loop(self, ws: web.WebSocketResponse, session: LightBridgeSession):
         smooth_r, smooth_g, smooth_b = 0.0, 0.0, 0.0
@@ -579,6 +665,9 @@ class BridgeServerController:
         snap = self.get_cfg_snapshot()
         session = LightBridgeSession(snap)
         dp_switch = int(snap.get("dp_switch", 20))
+        dp_mode = int(snap.get("dp_mode", 21))
+        adv_ver: int | None = None
+        dp_ack_logged = False
         stream_task: asyncio.Task | None = None
         probe_task: asyncio.Task | None = None
 
@@ -592,11 +681,11 @@ class BridgeServerController:
                     data = json.loads(msg.data)
                     if data.get("type") == "ble_connected":
                         mtu = int(data.get("mtu", 23))
-                        session.reset()
+                        session.reset(protocol_version=adv_ver)
                         if probe_task:
                             probe_task.cancel()
                         probe_task = asyncio.create_task(
-                            self._handshake_probe_loop(ws, session, mtu)
+                            self._handshake_probe_loop(ws, session, mtu, adv_ver)
                         )
 
                     elif data.get("type") == "ble_gatt_dump":
@@ -613,6 +702,9 @@ class BridgeServerController:
                             self._emit("log", text=f"  Read {k[4:8]}: {v}")
                         if adv_hex:
                             self._emit("log", text=f"  Adv: {adv_hex[:64]}")
+                            adv_ver = parse_adv_protocol(adv_hex)
+                            if adv_ver:
+                                self._emit("log", text=f"  Версия протокола Tuya BLE из рекламы: v{adv_ver}")
 
                     elif data.get("type") == "ble_tx_err":
                         self._emit(
@@ -634,20 +726,29 @@ class BridgeServerController:
                     if probe_task:
                         probe_task.cancel()
                     self._emit("log", text=f"BLE RX ({len(msg.data)} байт): {msg.data.hex()}")
-                    parsed = session.feed_ble_chunk(msg.data)
+                    try:
+                        parsed = session.feed_ble_chunk(msg.data)
+                    except ValueError as e:
+                        err_msg = f"Не удалось разобрать пакет лампы: {e}"
+                        self._emit("log", text=err_msg)
+                        await ws.send_str(json.dumps({"status": err_msg}))
+                        continue
                     if not parsed:
                         continue
 
-                    _sn, code, payload = parsed
+                    rx_sn, code, payload = parsed
 
-                    if code == 0x0000:
-                        ver = payload[2] if len(payload) > 2 else "?"
-                        self._emit("log", text=f"Ответ чипа получен (v{ver}), отправка Pair...")
+                    if code == CODE_DEVICE_INFO:
+                        self._emit(
+                            "log",
+                            text=f"Ответ лампы получен (протокол v{payload[2] if len(payload) > 2 else '?'}), отправка Pair...",
+                        )
                         await ws.send_str(json.dumps({"log": "Обмен ключами..."}))
                         await self._send_chunks(ws, session.handle_device_info_resp(payload))
 
-                    elif code == 0x0001:
-                        if payload and payload[0] == 0x00:
+                    elif code == CODE_PAIR:
+                        # 0 — успех, 2 — лампа уже сопряжена (тоже успех)
+                        if payload and payload[0] in (0x00, 0x02):
                             session.paired = True
                             self._emit("client_state", connected=True, text="Синхронизация активна!")
                             self._emit("log", text="Авторизация успешна! Трансляция цвета запущена.")
@@ -661,13 +762,34 @@ class BridgeServerController:
                             )
                             await self._send_chunks(ws, session.make_dp_bool(dp_switch, True))
                             await asyncio.sleep(0.15)
+                            if dp_mode > 0:
+                                # work_mode: 0 — white, 1 — colour
+                                await self._send_chunks(ws, session.make_dp_enum(dp_mode, 1))
+                                await asyncio.sleep(0.15)
                             if stream_task:
                                 stream_task.cancel()
                             stream_task = asyncio.create_task(self._ambilight_loop(ws, session))
                         else:
-                            err_msg = f"Ошибка ключа лампы (код {payload.hex()})"
+                            err_msg = (
+                                f"Лампа отклонила Pair (код {payload.hex()}). "
+                                "Проверьте Device ID, Local Key и UUID."
+                            )
                             self._emit("log", text=err_msg)
                             await ws.send_str(json.dumps({"status": err_msg, "log": err_msg}))
+
+                    elif code in (CODE_DPS, CODE_DPS_V4):
+                        if payload and payload[-1] != 0x00:
+                            self._emit("log", text=f"Лампа отклонила DP-команду (ответ {payload.hex()})")
+                        elif not dp_ack_logged:
+                            dp_ack_logged = True
+                            self._emit("log", text="Лампа приняла DP-команду")
+
+                    else:
+                        reply = session.make_response(code, rx_sn, payload)
+                        if reply:
+                            await self._send_chunks(ws, reply)
+                        else:
+                            self._emit("log", text=f"Пакет лампы 0x{code:04x}: {payload.hex()}")
 
                 elif msg.type == WSMsgType.ERROR:
                     self._emit("log", text=f"Ошибка WebSocket: {ws.exception()}")
@@ -1095,7 +1217,7 @@ class LumaLinkApp:
         self.var_uuid = tk.StringVar(value=self.cfg.get("device_uuid", ""))
         self.var_dp_switch = tk.StringVar(value=str(self.cfg.get("dp_switch", 20)))
         self.var_dp_colour = tk.StringVar(value=str(self.cfg.get("dp_colour", 24)))
-        self.var_proto = tk.IntVar(value=int(self.cfg.get("protocol_version", 4)))
+        self.var_proto = tk.IntVar(value=int(self.cfg.get("protocol_version", 3)))
 
         self._add_field(keys_card, "Device ID:", self.var_dev_id)
         self._add_field(keys_card, "Local Key (16 симв.):", self.var_local_key)
@@ -1245,7 +1367,7 @@ class LumaLinkApp:
                 "device_uuid": self.var_uuid.get().strip(),
                 "dp_switch": int(self.var_dp_switch.get() or 20),
                 "dp_colour": int(self.var_dp_colour.get() or 24),
-                "protocol_version": int(self.var_proto.get() or 4),
+                "protocol_version": int(self.var_proto.get() or 3),
                 "brightness": self.var_brightness.get(),
                 "smoothing": self.var_smoothing.get(),
                 "fps": self.var_fps.get(),
