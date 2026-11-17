@@ -445,10 +445,17 @@ class LightBridgeSession:
     def make_dp_enum(self, dp_id: int, value: int) -> list[bytes]:
         return self._wrap_dp_command(self._dp_item(dp_id, 0x04, bytes([value & 0xFF])))
 
+    def make_dp_value(self, dp_id: int, value: int) -> list[bytes]:
+        val_bytes = struct.pack(">I", int(value))
+        return self._wrap_dp_command(self._dp_item(dp_id, 0x02, val_bytes))
+
     def make_dp_color_hsv(
         self, dp_id: int, r: int, g: int, b: int, brightness_scale: float
     ) -> list[bytes]:
         h, s, v = colorsys.rgb_to_hsv(r / 255.0, g / 255.0, b / 255.0)
+        # Усиление насыщенности для сочного Ambilight на светодиодах
+        if s > 0.01:
+            s = min(1.0, s * 2.2 + 0.12)
         h_int = int(round(h * 360)) % 360
         s_int = int(round(s * 1000))
         v_int = int(round(v * 1000 * max(0.05, min(1.0, brightness_scale))))
@@ -567,6 +574,8 @@ class BridgeServerController:
         self._thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stop_event: asyncio.Event | None = None
+        self._active_ws: web.WebSocketResponse | None = None
+        self._active_session: LightBridgeSession | None = None
 
     def update_live_settings(self, new_cfg: dict):
         with self.lock:
@@ -592,6 +601,38 @@ class BridgeServerController:
 
     def _emit(self, event_type: str, **kwargs):
         self.ui_queue.put({"type": event_type, **kwargs})
+
+    def send_manual_dp(self, dp_id: int, dp_type: str, value: Any):
+        if not self._loop or not self.running:
+            self._emit("log", text="Сервер не запущен — сначала запустите сервер!")
+            return
+        asyncio.run_coroutine_threadsafe(self._async_send_manual_dp(dp_id, dp_type, value), self._loop)
+
+    async def _async_send_manual_dp(self, dp_id: int, dp_type: str, value: Any):
+        if not self._active_ws or not self._active_session or self._active_ws.closed:
+            self._emit("log", text="Нельзя отправить команду: смартфон или лампа не подключены!")
+            return
+        session = self._active_session
+        ws = self._active_ws
+        chunks = []
+        try:
+            if dp_type == "bool":
+                chunks = session.make_dp_bool(dp_id, bool(value))
+                self._emit("log", text=f"Тест команды: DP {dp_id} (питание) = {value}")
+            elif dp_type == "enum":
+                chunks = session.make_dp_enum(dp_id, int(value))
+                self._emit("log", text=f"Тест команды: DP {dp_id} (режим) = {value}")
+            elif dp_type == "color":
+                r, g, b = value
+                chunks = session.make_dp_color_hsv(dp_id, r, g, b, 1.0)
+                self._emit("log", text=f"Тест команды: DP {dp_id} (цвет) = RGB({r},{g},{b})")
+            elif dp_type == "value":
+                chunks = session.make_dp_value(dp_id, int(value))
+                self._emit("log", text=f"Тест команды: DP {dp_id} (значение) = {value}")
+            if chunks:
+                await self._send_chunks(ws, chunks)
+        except Exception as e:
+            self._emit("log", text=f"Ошибка отправки команды: {e}")
 
     def _run_thread(self):
         self._loop = asyncio.new_event_loop()
@@ -737,6 +778,8 @@ class BridgeServerController:
         probe_task: asyncio.Task | None = None
 
         peer = request.remote or "Смартфон"
+        self._active_ws = ws
+        self._active_session = session
         self._emit("client_state", connected=True, text=f"Подключён телефон ({peer})")
         self._emit("log", text=f"Смартфон подключился ({peer})")
 
@@ -901,6 +944,8 @@ class BridgeServerController:
             except Exception:
                 pass
         finally:
+            self._active_ws = None
+            self._active_session = None
             if probe_task:
                 probe_task.cancel()
             if stream_task:
@@ -1399,6 +1444,46 @@ class LumaLinkApp:
             command=self._save_only,
         )
         btn_save.pack(side="left", padx=(10, 0))
+
+        # Карточка экспресс-теста лампы (для быстрой диагностики работы DPs)
+        test_card = tk.Frame(container, bg=self.BG_CARD, highlightbackground=self.BORDER, highlightthickness=1, padx=10, pady=8)
+        test_card.pack(fill="x", pady=(0, 10))
+
+        tk.Label(test_card, text="Тест:", font=("Segoe UI", 9, "bold"), fg=self.TEXT_PRIMARY, bg=self.BG_CARD).pack(side="left", padx=(0, 6))
+
+        tk.Button(
+            test_card, text="Выкл", font=("Segoe UI", 8, "bold"), bg=self.RED, fg=self.TEXT_PRIMARY,
+            bd=0, padx=6, pady=2, cursor="hand2", activebackground="#DC2626", activeforeground=self.TEXT_PRIMARY,
+            command=lambda: self.controller.send_manual_dp(int(self.var_dp_switch.get() or 1), "bool", False)
+        ).pack(side="left", padx=2)
+
+        tk.Button(
+            test_card, text="Вкл", font=("Segoe UI", 8, "bold"), bg=self.GREEN, fg="#0B0E14",
+            bd=0, padx=6, pady=2, cursor="hand2", activebackground="#059669", activeforeground="#0B0E14",
+            command=lambda: self.controller.send_manual_dp(int(self.var_dp_switch.get() or 1), "bool", True)
+        ).pack(side="left", padx=(2, 8))
+
+        tk.Label(test_card, text="Режим (DP2):", font=("Segoe UI", 9), fg=self.TEXT_MUTED, bg=self.BG_CARD).pack(side="left", padx=(0, 2))
+        for m_val, m_title in [(0, "0 Белый"), (1, "1 Цвет"), (2, "2 Сцена"), (3, "3 Музыка")]:
+            tk.Button(
+                test_card, text=str(m_val), font=("Consolas", 8, "bold"), bg=self.BG_INPUT, fg=self.CYAN if m_val == 1 else self.TEXT_PRIMARY,
+                bd=0, padx=5, pady=2, cursor="hand2", activebackground=self.BORDER, activeforeground=self.TEXT_PRIMARY,
+                command=lambda v=m_val: self.controller.send_manual_dp(int(self.var_dp_mode.get() or 2), "enum", v)
+            ).pack(side="left", padx=1)
+
+        tk.Label(test_card, text="Цвет:", font=("Segoe UI", 9), fg=self.TEXT_MUTED, bg=self.BG_CARD).pack(side="left", padx=(8, 2))
+        colors_to_test = [
+            ("Красный", (255, 0, 0), "#EF4444", "#FFFFFF"),
+            ("Зелёный", (0, 255, 0), "#10B981", "#0B0E14"),
+            ("Синий", (0, 100, 255), "#3B82F6", "#FFFFFF"),
+            ("Белый", (255, 255, 255), "#E2E8F0", "#0B0E14")
+        ]
+        for c_lbl, c_rgb, c_bg, c_fg in colors_to_test:
+            tk.Button(
+                test_card, text=c_lbl, font=("Segoe UI", 8), bg=c_bg, fg=c_fg,
+                bd=0, padx=6, pady=2, cursor="hand2",
+                command=lambda rgb=c_rgb: self.controller.send_manual_dp(int(self.var_dp_colour.get() or 24), "color", rgb)
+            ).pack(side="left", padx=2)
 
         log_card = tk.Frame(
             container, bg=self.BG_CARD, highlightbackground=self.BORDER, highlightthickness=1, padx=12, pady=10
