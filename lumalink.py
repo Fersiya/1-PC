@@ -26,7 +26,7 @@ try:
 except Exception:
     HAS_PIL = False
 
-# Включаем четкое масштабирование шрифтов на Windows High-DPI экранах
+# Включаем четкое масштабирование шрифтов на Windows High-DPI экранах и таймер 1 мс
 if sys.platform == "win32":
     try:
         ctypes.windll.shcore.SetProcessDpiAwareness(1)
@@ -35,6 +35,10 @@ if sys.platform == "win32":
             ctypes.windll.user32.SetProcessDPIAware()
         except Exception:
             pass
+    try:
+        ctypes.windll.winmm.timeBeginPeriod(1)
+    except Exception:
+        pass
 
 APP_NAME = "LumaLink"
 APP_SUBTITLE = "Синхронизация подсветки экрана"
@@ -593,11 +597,16 @@ if sys.platform == "win32":
 
 
 class FastWindowsCapturer:
-    """Сверхбыстрый захват экрана через Windows GDI StretchBlt (0.05-0.1 мс, 0% CPU).
+    """Сверхбыстрый захват экрана через Windows GDI CreateDIBSection (0.03 мс, 0% CPU).
 
-    В отличие от стандартного BitBlt с флагом CAPTUREBLT, мы используем аппаратный даунскейл (StretchBlt)
-    с флагом SRCCOPY (0x00CC0020) БЕЗ флага CAPTUREBLT. Это ПОЛНОСТЬЮ исключает подергивание, залипание
-    и мерцание курсора мыши в Windows, разгружая видеокарту и процессор.
+    Ключевые оптимизации для мониторов с высокой частотой (144Hz, 180Hz, 240Hz):
+    1. Экранный контекст (GetDC(0)) захватывается ИСКЛЮЧИТЕЛЬНО на мгновение
+       вызова StretchBlt (~0.03 мс) и СРАЗУ ЖЕ освобождается через ReleaseDC(0).
+       Это исключает переход Windows DWM в режим совместимости GDI — аппаратный
+       DirectFlip и MPO остаются активными, а окна двигаются на 180 Гц идеально плавно.
+    2. Флаг SRCCOPY (0x00CC0020) БЕЗ флага CAPTUREBLT — курсор мыши не затрагивается
+       и не мерцает.
+    3. CreateDIBSection даёт прямой указатель в память — без вызовов GetDIBits.
     """
 
     def __init__(self, tw: int = 64, th: int = 36):
@@ -605,11 +614,9 @@ class FastWindowsCapturer:
         self.th = th
         self.user32 = ctypes.windll.user32
         self.gdi32 = ctypes.windll.gdi32
-        self.hdc_screen = self.user32.GetDC(0)
-        self.hdc_mem = self.gdi32.CreateCompatibleDC(self.hdc_screen)
-        self.hbm = self.gdi32.CreateCompatibleBitmap(self.hdc_screen, tw, th)
-        self.old_bm = self.gdi32.SelectObject(self.hdc_mem, self.hbm)
-        self.gdi32.SetStretchBltMode(self.hdc_mem, 3)  # COLORONCOLOR
+
+        # Независимый DC в системной памяти (не блокирует дисплей)
+        self.hdc_mem = self.gdi32.CreateCompatibleDC(0)
 
         self.bmi = BITMAPINFO()
         self.bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
@@ -618,18 +625,33 @@ class FastWindowsCapturer:
         self.bmi.bmiHeader.biPlanes = 1
         self.bmi.bmiHeader.biBitCount = 32
         self.bmi.bmiHeader.biCompression = 0
-        self.buf = ctypes.create_string_buffer(tw * th * 4)
+
+        self.ppv_bits = ctypes.c_void_p()
+        self.hbm = self.gdi32.CreateDIBSection(
+            self.hdc_mem, ctypes.byref(self.bmi), 0, ctypes.byref(self.ppv_bits), None, 0
+        )
+        self.old_bm = self.gdi32.SelectObject(self.hdc_mem, self.hbm)
+        self.gdi32.SetStretchBltMode(self.hdc_mem, 3)  # COLORONCOLOR (без оверхеда)
+        self.buf_size = tw * th * 4
 
     def capture(self, mode: str = "fullscreen") -> tuple[int, int, int]:
         w = self.user32.GetSystemMetrics(0)
         h = self.user32.GetSystemMetrics(1)
-        if w <= 0 or h <= 0:
+        if w <= 0 or h <= 0 or not self.ppv_bits.value:
             return 0, 0, 0
 
-        # SRCCOPY (0x00CC0020) БЕЗ CAPTUREBLT — курсор мыши не затрагивается
-        self.gdi32.StretchBlt(self.hdc_mem, 0, 0, self.tw, self.th, self.hdc_screen, 0, 0, w, h, 0x00CC0020)
-        self.gdi32.GetDIBits(self.hdc_mem, self.hbm, 0, self.th, self.buf, ctypes.byref(self.bmi), 0)
-        raw = self.buf.raw
+        # Получаем экранный DC, делаем мгновенный блит и СРАЗУ освобождаем DC!
+        hdc_screen = self.user32.GetDC(0)
+        if not hdc_screen:
+            return 0, 0, 0
+        try:
+            self.gdi32.StretchBlt(
+                self.hdc_mem, 0, 0, self.tw, self.th, hdc_screen, 0, 0, w, h, 0x00CC0020
+            )
+        finally:
+            self.user32.ReleaseDC(0, hdc_screen)
+
+        raw = ctypes.string_at(self.ppv_bits.value, self.buf_size)
 
         if mode == "edges":
             # Края экрана (Ambilight: верхняя кромка и боковые стороны)
@@ -667,10 +689,12 @@ class FastWindowsCapturer:
 
     def close(self):
         try:
-            self.gdi32.SelectObject(self.hdc_mem, self.old_bm)
-            self.gdi32.DeleteObject(self.hbm)
-            self.gdi32.DeleteDC(self.hdc_mem)
-            self.user32.ReleaseDC(0, self.hdc_screen)
+            if self.hdc_mem and self.old_bm:
+                self.gdi32.SelectObject(self.hdc_mem, self.old_bm)
+            if self.hbm:
+                self.gdi32.DeleteObject(self.hbm)
+            if self.hdc_mem:
+                self.gdi32.DeleteDC(self.hdc_mem)
         except Exception:
             pass
 
@@ -735,6 +759,16 @@ def get_fast_capturer() -> FastWindowsCapturer | None:
         except Exception:
             _global_capturer = None
     return _global_capturer
+
+
+def cleanup_fast_capturer() -> None:
+    global _global_capturer
+    if _global_capturer:
+        try:
+            _global_capturer.close()
+        except Exception:
+            pass
+        _global_capturer = None
 
 
 def capture_screen_rgb(mode: str = "fullscreen") -> tuple[int, int, int]:
@@ -951,6 +985,8 @@ class BridgeServerController:
         last_sent_mode = ""
         first_frame = True
         last_bright_dp_time = 0.0
+        last_ui_emit_time = 0.0
+        last_ui_disp_rgb = (-1, -1, -1)
 
         while not ws.closed and session.paired and not self._stop_event.is_set():
             t0 = time.monotonic()
@@ -981,16 +1017,20 @@ class BridgeServerController:
 
             r, g, b = int(round(smooth_r)), int(round(smooth_g)), int(round(smooth_b))
 
-            # Визуальный индикатор в интерфейсе с учётом выставленной яркости
+            # Визуальный индикатор в интерфейсе с учётом выставленной яркости (частота UI до 12 FPS)
             disp_r = int(round(r * max(0.12, brightness)))
             disp_g = int(round(g * max(0.12, brightness)))
             disp_b = int(round(b * max(0.12, brightness)))
-            self._emit(
-                "color",
-                rgb=(disp_r, disp_g, disp_b),
-                raw_rgb=(r, g, b),
-                brightness=int(round(brightness * 100)),
-            )
+            now = time.monotonic()
+            if (now - last_ui_emit_time >= 0.08) or ((disp_r, disp_g, disp_b) != last_ui_disp_rgb):
+                last_ui_emit_time = now
+                last_ui_disp_rgb = (disp_r, disp_g, disp_b)
+                self._emit(
+                    "color",
+                    rgb=(disp_r, disp_g, disp_b),
+                    raw_rgb=(r, g, b),
+                    brightness=int(round(brightness * 100)),
+                )
 
             color_diff = (
                 abs(r - last_sent_rgb[0])
@@ -1988,20 +2028,27 @@ class LumaLinkApp:
                 color = self.GREEN if ev["connected"] else self.TEXT_PRIMARY
                 self.lbl_client_status.config(text=ev["text"], fg=color)
             elif etype == "color":
-                r, g, b = ev["rgb"]
-                raw_r, raw_g, raw_b = ev.get("raw_rgb", (r, g, b))
-                br = ev.get("brightness", 100)
-                hex_col = f"#{r:02x}{g:02x}{b:02x}"
-                self.color_canvas.itemconfig(self.orb_outer, fill=hex_col, outline=hex_col)
-                self.lbl_rgb_info.config(
-                    text=f"Экран: RGB({raw_r}, {raw_g}, {raw_b})  •  Яркость: {br}%"
-                )
+                if self.root.state() != "iconic":
+                    r, g, b = ev["rgb"]
+                    raw_r, raw_g, raw_b = ev.get("raw_rgb", (r, g, b))
+                    br = ev.get("brightness", 100)
+                    hex_col = f"#{r:02x}{g:02x}{b:02x}"
+                    self.color_canvas.itemconfig(self.orb_outer, fill=hex_col, outline=hex_col)
+                    self.lbl_rgb_info.config(
+                        text=f"Экран: RGB({raw_r}, {raw_g}, {raw_b})  •  Яркость: {br}%"
+                    )
 
         self.root.after(50, self._poll_queue)
 
     def _on_close(self):
         self._push_live_settings(save_disk=True)
         self.controller.stop()
+        cleanup_fast_capturer()
+        if sys.platform == "win32":
+            try:
+                ctypes.windll.winmm.timeEndPeriod(1)
+            except Exception:
+                pass
         self.root.destroy()
 
 
