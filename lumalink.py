@@ -194,6 +194,8 @@ CODE_RECV_DP = 0x8001
 CODE_RECV_TIME_DP = 0x8003
 CODE_RECV_SIGN_DP = 0x8004
 CODE_RECV_SIGN_TIME_DP = 0x8005
+CODE_RECV_DP_V4 = 0x8006
+CODE_RECV_TIME_DP_V4 = 0x8007
 CODE_RECV_TIME1_REQ = 0x8011
 CODE_RECV_TIME2_REQ = 0x8012
 
@@ -201,7 +203,11 @@ TUYA_COMPANY_ID = 0x07D0
 
 
 def parse_adv_protocol(adv_hex: str) -> int | None:
-    """Версия протокола Tuya BLE из рекламного пакета (manufacturer data, company id 0x07D0)."""
+    """Версия протокола Tuya BLE из рекламного пакета.
+
+    FD50 (протокол 4): старший полубайт первого байта service data 0xFD50.
+    Classic (протокол 2/3): байт 1 manufacturer data (company id 0x07D0).
+    """
     try:
         raw = bytes.fromhex(adv_hex)
     except ValueError:
@@ -213,7 +219,11 @@ def parse_adv_protocol(adv_hex: str) -> int | None:
             break
         ad_type = raw[pos + 1]
         body = raw[pos + 2 : pos + 1 + ln]
-        if (
+        if ad_type == 0x16 and len(body) >= 3 and int.from_bytes(body[0:2], "little") == 0xFD50:
+            if body[2] & 0x01:  # запись идентификации
+                ver = body[2] >> 4
+                return ver if ver in (2, 3, 4) else None
+        elif (
             ad_type == 0xFF
             and len(body) >= 4
             and int.from_bytes(body[0:2], "little") == TUYA_COMPANY_ID
@@ -364,9 +374,11 @@ class LightBridgeSession:
         self.protocol_version = proto_ver
         self.chunk_size = chunk_size
         self.sn = 1
+        # Протокол 4: ровно 2 байта (размер данных в пакете), иначе лампа сама рвёт связь.
+        info_payload = struct.pack(">H", chunk_size) if proto_ver >= 4 else b""
         return self._build_frame(
             code=CODE_DEVICE_INFO,
-            data=b"",
+            data=info_payload,
             proto_ver=proto_ver,
             chunk_size=chunk_size,
         )
@@ -400,6 +412,10 @@ class LightBridgeSession:
             )
         elif code in (CODE_RECV_DP, CODE_RECV_TIME_DP):
             data = b""
+        elif code in (CODE_RECV_DP_V4, CODE_RECV_TIME_DP_V4) and len(payload) >= 7:
+            if payload[5] & 0x80:  # устройство не ждёт подтверждения
+                return None
+            data = payload[:7] + b"\x00"
         elif code in (CODE_RECV_SIGN_DP, CODE_RECV_SIGN_TIME_DP) and len(payload) >= 3:
             data = payload[:2] + bytes([payload[2], 0])
         else:
@@ -407,8 +423,7 @@ class LightBridgeSession:
         return self._build_frame(code=code, data=data, ack_sn=ack_sn)
 
     def _dp_item(self, dp_id: int, dp_type: int, value: bytes) -> bytes:
-        # Tuya BLE v3 (проверено по ha_tuya_ble): длина значения — 1 байт.
-        # Для v4 формат оставлен прежним (2 байта), в эталоне он не реализован.
+        # v3: длина значения — 1 байт (ha_tuya_ble); v4: 2 байта (SDK Tuya, ha_tuya_ble v4).
         if self.protocol_version >= 4:
             return struct.pack(">BBH", dp_id, dp_type, len(value)) + value
         return struct.pack(">BBB", dp_id, dp_type, len(value)) + value
@@ -417,7 +432,7 @@ class LightBridgeSession:
         if self.protocol_version >= 4:
             sn = self.dp_sn
             self.dp_sn += 1
-            v4_data = struct.pack(">IB", sn, 0x00) + dp_packet
+            v4_data = struct.pack(">BI", 0x00, sn) + dp_packet
             return self._build_frame(code=CODE_DPS_V4, data=v4_data)
         return self._build_frame(code=CODE_DPS, data=dp_packet)
 
@@ -588,10 +603,9 @@ class BridgeServerController:
 
         # Запрос Device Info всегда идёт с login_key (флаг 0x04); перебираем только
         # версию протокола в заголовке и размер чанка.
-        versions: list[int] = []
-        for v in (pref_ver, 3, 2, 4):
-            if v not in versions:
-                versions.append(v)
+        versions: list[int] = [pref_ver]
+        if not adv_ver:  # версия не известна из рекламы — пробуем остальные
+            versions += [v for v in (3, 4, 2) if v != pref_ver]
         probes = [(v, 20, f"v{v}, чанк 20 Б") for v in versions]
         if full_chunk > 20:
             probes.append((pref_ver, full_chunk, f"v{pref_ver}, чанк {full_chunk} Б"))
