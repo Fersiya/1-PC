@@ -148,6 +148,7 @@ class LightBridgeSession:
         self.local_key = cfg["local_key"].strip().encode("utf-8")
         self.uuid = cfg["device_uuid"].strip().encode("utf-8")[:16]
         self.protocol_version = int(cfg.get("protocol_version", 4))
+        self.mtu_payload_size = 20
 
         self.login_key = hashlib.md5(self.local_key[:6]).digest()
         self.session_key: bytes | None = None
@@ -158,9 +159,10 @@ class LightBridgeSession:
         self._rx_buf = bytearray()
         self._rx_expected_len = 0
 
-    def reset(self, protocol_version: int | None = None):
+    def reset(self, protocol_version: int | None = None, mtu: int = 23):
         if protocol_version is not None:
             self.protocol_version = protocol_version
+        self.mtu_payload_size = max(20, min(240, int(mtu) - 3))
         self.session_key = None
         self.sn = 1
         self.dp_sn = 1
@@ -197,6 +199,7 @@ class LightBridgeSession:
         pack_num = 0
         pos = 0
         total_len = len(encrypted)
+        max_pkt = self.mtu_payload_size
 
         while pos < total_len:
             pkt = bytearray()
@@ -204,7 +207,7 @@ class LightBridgeSession:
             if pack_num == 0:
                 pkt.extend(pack_varint(total_len))
                 pkt.append(self.protocol_version << 4)
-            space = 20 - len(pkt)
+            space = max_pkt - len(pkt)
             pkt.extend(encrypted[pos : pos + space])
             pos += space
             pack_num += 1
@@ -487,9 +490,18 @@ class BridgeServerController:
                     data = json.loads(msg.data)
                     if data.get("type") == "ble_connected":
                         cur_proto = int(self.get_cfg_snapshot().get("protocol_version", 4))
-                        session.reset(protocol_version=cur_proto)
-                        self._emit("log", text=f"Канал BLE готов -> отправка запроса (протокол v{cur_proto})...")
-                        await self._send_chunks(ws, session.make_device_info_req())
+                        mtu = int(data.get("mtu", 23))
+                        w_props = data.get("write_props", "?")
+                        session.reset(protocol_version=cur_proto, mtu=mtu)
+                        chunks = session.make_device_info_req()
+                        self._emit(
+                            "log",
+                            text=f"Канал BLE (MTU={mtu}, props={w_props}) -> TX {len(chunks)} пак. (v{cur_proto})",
+                        )
+                        await self._send_chunks(ws, chunks)
+
+                    elif data.get("type") == "ble_tx_err":
+                        self._emit("log", text=f"Ошибка записи BLE на телефоне: status={data.get('status')}, len={data.get('len')}")
 
                     elif data.get("type") == "ble_disconnected":
                         session.reset()
