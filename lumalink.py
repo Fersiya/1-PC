@@ -148,6 +148,7 @@ class LightBridgeSession:
         self.local_key = cfg["local_key"].strip().encode("utf-8")
         self.uuid = cfg["device_uuid"].strip().encode("utf-8")[:16]
         self.protocol_version = int(cfg.get("protocol_version", 4))
+        # Стандарт Tuya BLE требует фрагментацию строго по 20 байт на GATT-пакет
         self.mtu_payload_size = 20
 
         self.login_key = hashlib.md5(self.local_key[:6]).digest()
@@ -159,10 +160,10 @@ class LightBridgeSession:
         self._rx_buf = bytearray()
         self._rx_expected_len = 0
 
-    def reset(self, protocol_version: int | None = None, mtu: int = 23):
+    def reset(self, protocol_version: int | None = None):
         if protocol_version is not None:
             self.protocol_version = protocol_version
-        self.mtu_payload_size = max(20, min(240, int(mtu) - 3))
+        self.mtu_payload_size = 20
         self.session_key = None
         self.sn = 1
         self.dp_sn = 1
@@ -492,11 +493,11 @@ class BridgeServerController:
                         cur_proto = int(self.get_cfg_snapshot().get("protocol_version", 4))
                         mtu = int(data.get("mtu", 23))
                         w_props = data.get("write_props", "?")
-                        session.reset(protocol_version=cur_proto, mtu=mtu)
+                        session.reset(protocol_version=cur_proto)
                         chunks = session.make_device_info_req()
                         self._emit(
                             "log",
-                            text=f"Канал BLE (MTU={mtu}, props={w_props}) -> TX {len(chunks)} пак. (v{cur_proto})",
+                            text=f"Канал BLE (MTU={mtu}, props={w_props}) -> TX {len(chunks)}x20B (v{cur_proto})",
                         )
                         await self._send_chunks(ws, chunks)
 
