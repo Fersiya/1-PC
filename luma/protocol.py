@@ -429,10 +429,10 @@ class LightBridgeSession:
         items.append((61, 0x00, dp61_raw))
         return self.make_combined_dps(items)
 
-    def make_segments(self, rgbs: list[tuple[int, int, int]], brightness_scale: float = 1.0) -> list[bytes]:
+    def make_segments(self, rgbs: list[tuple[int, tuple[int, int, int]]], brightness_scale: float = 1.0) -> list[bytes]:
         """Каждый сегмент — отдельная команда DP 61 «single»: ver, режим Colour, эффект 0, номер LED, smear=1 (точка), HSV."""
         items = []
-        for idx, (r, g, b) in enumerate(rgbs):
+        for idx, (r, g, b) in rgbs:
             h, s, v = colorsys.rgb_to_hsv(r / 255.0, g / 255.0, b / 255.0)
             if s > 0.01:
                 s = min(1.0, s * 2.2 + 0.12)

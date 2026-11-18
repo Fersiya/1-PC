@@ -230,6 +230,7 @@ class BridgeServerController:
         last_ui_disp_rgb = (-1, -1, -1)
         zone_smooth: list[list[float]] = []
         last_zone_sent: list[tuple[int, int, int]] = []
+        last_seg_time = 0.0
 
         while not ws.closed and session.paired and not self._stop_event.is_set():
             t0 = time.monotonic()
@@ -326,19 +327,24 @@ class BridgeServerController:
                         for k in range(3):
                             zs[k] = zs[k] * a + z[k] * (1.0 - a)
                 cur = [tuple(int(round(c)) for c in zs) for zs in zone_smooth]
-                changed = (
-                    len(last_zone_sent) != segments
-                    or brightness_changed
-                    or any(
-                        abs(a[0] - b2[0]) + abs(a[1] - b2[1]) + abs(a[2] - b2[2]) >= 3
-                        for a, b2 in zip(cur, last_zone_sent)
-                    )
-                )
-                if changed and not session.should_wait_for_ack():
-                    last_zone_sent = cur
+                if len(last_zone_sent) != segments:
+                    last_zone_sent = [(-100, -100, -100)] * segments
+                # Лампе шлём только изменившиеся сегменты и не чаще ~4 раз/с: иначе она перегружается и рвёт связь
+                changed_items = [
+                    (i, c)
+                    for i, (c, o) in enumerate(zip(cur, last_zone_sent))
+                    if abs(c[0] - o[0]) + abs(c[1] - o[1]) + abs(c[2] - o[2]) >= 6
+                ]
+                if brightness_changed:
+                    changed_items = list(enumerate(cur))
+                now_m = time.monotonic()
+                if changed_items and now_m - last_seg_time >= 0.25 and not session.should_wait_for_ack():
+                    last_seg_time = now_m
+                    for i, c in changed_items:
+                        last_zone_sent[i] = c
                     last_sent_brightness = brightness
                     try:
-                        await self._send_chunks(ws, session.make_segments(cur, brightness))
+                        await self._send_chunks(ws, session.make_segments(changed_items, brightness))
                     except Exception:
                         break
             elif should_send and not first_frame and session.should_wait_for_ack():
