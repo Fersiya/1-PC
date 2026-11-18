@@ -299,7 +299,7 @@ class BridgeServerController:
                 + abs(g - last_sent_rgb[1])
                 + abs(b - last_sent_rgb[2])
             )
-            brightness_changed = abs(brightness - last_sent_brightness) >= 0.015
+            brightness_changed = abs(brightness - last_sent_brightness) >= 0.005
             mode_changed = mode != last_sent_mode
             min_diff = 1 if smoothing > 0.1 else 2
 
@@ -351,14 +351,6 @@ class BridgeServerController:
                 should_send = False  # лампа ещё не приняла прошлый цвет — отправим свежий в следующем цикле
 
             if should_send:
-                include_bright = (
-                    brightness_changed
-                    or first_frame
-                    or (time.monotonic() - last_bright_dp_time > 3.0)
-                )
-                if include_bright:
-                    last_bright_dp_time = time.monotonic()
-
                 last_sent_rgb = (r, g, b)
                 last_sent_brightness = brightness
                 last_sent_mode = mode
@@ -383,7 +375,7 @@ class BridgeServerController:
                             g,
                             b,
                             brightness,
-                            include_bright_dp=include_bright,
+                            include_bright_dp=True,
                         )
                     await self._send_chunks(ws, chunks)
                 except Exception:
@@ -446,6 +438,8 @@ class BridgeServerController:
                                 self._emit("log", text=f"  Версия протокола Tuya BLE из рекламы: v{adv_ver}")
 
                     elif data.get("type") == "ble_tx_err":
+                        if session.note_tx_err():
+                            self._emit("log", text="Ошибка отправки крупного пакета BLE — переключаюсь на размер 20 Б")
                         self._emit(
                             "log",
                             text=f"Ошибка записи BLE: status={data.get('status')}, len={data.get('len')}",
@@ -528,6 +522,7 @@ class BridgeServerController:
                             self._emit("log", text="Лампа приняла DP-команду")
 
                     else:
+                        session.note_dp_ack()
                         dps = session.parse_dp_payload(code, payload)
                         if dps:
                             mode_names = {0: "White", 1: "Colour", 2: "Scene", 3: "Music"}

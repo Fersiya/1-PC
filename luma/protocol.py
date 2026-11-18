@@ -323,24 +323,19 @@ class LightBridgeSession:
             self._fast_acks0 = self.dp_acks
 
     def check_fast_fallback(self) -> bool:
-        """Если лампа не подтверждает крупные пакеты — вернуть безопасный размер 20 Б."""
-        if (
-            self.fast_active
-            and self.dp_writes - self._fast_writes0 >= 6
-            and self.dp_acks == self._fast_acks0
-        ):
+        return False
+
+    def note_tx_err(self) -> bool:
+        """Если телефон сообщил об ошибке передачи крупного BLE-пакета — возвращаемся на 20 Б."""
+        if self.fast_active:
             self.fast_active = False
             self.chunk_size = 20
             return True
         return False
 
     def should_wait_for_ack(self) -> bool:
-        """Не копим очередь в BLE: пока нет подтверждения прошлого цвета (до 120 мс) — ждём."""
-        return (
-            self.dp_acks > 0
-            and self.awaiting_ack
-            and (time.monotonic() - self.last_dp_write) < 0.12
-        )
+        """Защита радиоканала от флуда: пауза не более 25 мс (~40 FPS) между отправками."""
+        return (time.monotonic() - self.last_dp_write) < 0.025
 
     def _wrap_dp_command(self, dp_packet: bytes) -> list[bytes]:
         self.dp_writes += 1
@@ -405,7 +400,7 @@ class LightBridgeSession:
         g: int,
         b: int,
         brightness_scale: float = 1.0,
-        include_bright_dp: bool = False,
+        include_bright_dp: bool = True,
     ) -> list[bytes]:
         h, s, v = colorsys.rgb_to_hsv(r / 255.0, g / 255.0, b / 255.0)
         # Усиление насыщенности для сочного Ambilight на светодиодах
@@ -413,7 +408,8 @@ class LightBridgeSession:
             s = min(1.0, s * 2.2 + 0.12)
         h_int = int(round(h * 360)) % 360
         s_int = int(round(s * 1000))
-        scaled_v = v * max(0.05, min(1.0, brightness_scale))
+        b_scale = max(0.05, min(1.0, brightness_scale))
+        scaled_v = v * b_scale
         v_int = int(round(scaled_v * 1000))
         hsv_ascii = f"{h_int:04x}{s_int:04x}{v_int:04x}".encode("ascii")
 
@@ -422,7 +418,7 @@ class LightBridgeSession:
 
         items = []
         if include_bright_dp:
-            bright_val = int(round(1000 * max(0.05, min(1.0, brightness_scale))))
+            bright_val = int(round(1000 * b_scale))
             items.append((47, 0x02, struct.pack(">I", bright_val)))
         if dp_id != 61:
             items.append((dp_id, 0x03, hsv_ascii))

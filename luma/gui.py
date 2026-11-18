@@ -384,7 +384,7 @@ class LumaLinkApp:
 
         self._add_slider(ctrl_card, "Яркость лампы", self.var_brightness, 10, 100, "%")
         self._add_slider(ctrl_card, "Плавность переходов", self.var_smoothing, 0, 85, "%")
-        self._add_slider(ctrl_card, "Частота обновления", self.var_fps, 5, 25, " FPS")
+        self._add_slider(ctrl_card, "Частота обновления", self.var_fps, 5, 30, " FPS")
         self._add_slider(ctrl_card, "Сегменты лампы (0 = один цвет, эксперимент)", self.var_segments, 0, 20, "")
 
         mode_row = tk.Frame(ctrl_card, bg=self.BG_CARD)

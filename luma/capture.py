@@ -85,10 +85,17 @@ class FastWindowsCapturer:
         self.old_bm = self.gdi32.SelectObject(self.hdc_mem, self.hbm)
         self.gdi32.SetStretchBltMode(self.hdc_mem, 3)  # COLORONCOLOR (без оверхеда)
         self.buf_size = tw * th * 4
+        self._w = self.user32.GetSystemMetrics(0)
+        self._h = self.user32.GetSystemMetrics(1)
+        self._last_metrics_check = time.monotonic()
 
     def capture(self, mode: str = "fullscreen") -> tuple[int, int, int]:
-        w = self.user32.GetSystemMetrics(0)
-        h = self.user32.GetSystemMetrics(1)
+        now_m = time.monotonic()
+        if now_m - self._last_metrics_check > 2.0:
+            self._w = self.user32.GetSystemMetrics(0)
+            self._h = self.user32.GetSystemMetrics(1)
+            self._last_metrics_check = now_m
+        w, h = self._w, self._h
         if w <= 0 or h <= 0 or not self.ppv_bits.value:
             return 0, 0, 0
 
@@ -141,8 +148,7 @@ class FastWindowsCapturer:
 
     def capture_zones(self, n: int) -> list[tuple[int, int, int]]:
         """Делит экран на n вертикальных полос (слева направо), средний цвет каждой."""
-        w = self.user32.GetSystemMetrics(0)
-        h = self.user32.GetSystemMetrics(1)
+        w, h = self._w, self._h
         if w <= 0 or h <= 0 or not self.ppv_bits.value:
             return [(0, 0, 0)] * n
         hdc_screen = self.user32.GetDC(0)
@@ -269,14 +275,12 @@ def is_window_moving() -> bool:
     return False
 
 
-# GDI-чтение рабочего стола заставляет DWM делать синхронный снимок — на 144–180 Гц это
-# даёт рывки окон. Поэтому: не снимаем во время перетаскивания окон и держим долю времени
-# захвата не выше ~8% (интервал >= 12 длительностей предыдущего снимка).
+# Захват экрана без искусственных задержек. При перетаскивании окон (is_window_moving)
+# возвращаем предыдущий цвет, чтобы не дергать DWM на 180 Гц экранах.
 _cap_state = {
     "rgb": (0, 0, 0), "t": 0.0, "ema": 0.0,
     "n": 0, "sum": 0.0, "max": 0.0, "skip_drag": 0, "skip_busy": 0,
 }
-_BUSY_FACTOR = 6.0
 
 
 def _capture_screen_rgb_raw(mode: str) -> tuple[int, int, int]:
@@ -295,9 +299,6 @@ def capture_screen_rgb(mode: str = "fullscreen") -> tuple[int, int, int]:
     if is_window_moving():
         st["skip_drag"] += 1
         return st["rgb"]
-    if st["ema"] > 0 and (now - st["t"]) < st["ema"] * _BUSY_FACTOR:
-        st["skip_busy"] += 1
-        return st["rgb"]
     rgb = _capture_screen_rgb_raw(mode)
     dt = time.perf_counter() - now
     st["rgb"] = rgb
@@ -313,12 +314,11 @@ _zone_state = {"zones": None, "t": 0.0}
 
 
 def capture_screen_zones(n: int, mode: str = "fullscreen") -> list[tuple[int, int, int]]:
-    """Цвета n полос экрана; при перетаскивании окон/нагрузке отдаёт прошлые значения."""
+    """Цвета n полос экрана; при перетаскивании окон отдаёт прошлые значения."""
     st = _zone_state
     now = time.perf_counter()
-    if st["zones"] is not None and len(st["zones"]) == n:
-        if is_window_moving() or (_cap_state["ema"] > 0 and (now - st["t"]) < _cap_state["ema"] * _BUSY_FACTOR):
-            return st["zones"]
+    if st["zones"] is not None and len(st["zones"]) == n and is_window_moving():
+        return st["zones"]
     cap = get_fast_capturer()
     zones = None
     if cap:
@@ -328,8 +328,6 @@ def capture_screen_zones(n: int, mode: str = "fullscreen") -> list[tuple[int, in
             zones = None
     if zones is None:
         zones = [capture_screen_rgb_fallback(mode)] * n
-    dt = time.perf_counter() - now
-    _cap_state["ema"] = dt if _cap_state["ema"] == 0 else _cap_state["ema"] * 0.8 + dt * 0.2
     st["zones"], st["t"] = zones, now
     return zones
 
