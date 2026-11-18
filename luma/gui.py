@@ -380,10 +380,12 @@ class LumaLinkApp:
         self.var_smoothing = tk.IntVar(value=int(self.cfg.get("smoothing", 45)))
         self.var_fps = tk.IntVar(value=int(self.cfg.get("fps", 14)))
         self.var_mode = tk.StringVar(value=self.cfg.get("capture_mode", "fullscreen"))
+        self.var_segments = tk.IntVar(value=int(self.cfg.get("segments", 0)))
 
         self._add_slider(ctrl_card, "Яркость лампы", self.var_brightness, 10, 100, "%")
         self._add_slider(ctrl_card, "Плавность переходов", self.var_smoothing, 0, 85, "%")
         self._add_slider(ctrl_card, "Частота обновления", self.var_fps, 5, 25, " FPS")
+        self._add_slider(ctrl_card, "Сегменты лампы (0 = один цвет, эксперимент)", self.var_segments, 0, 20, "")
 
         mode_row = tk.Frame(ctrl_card, bg=self.BG_CARD)
         mode_row.pack(fill="x", pady=(6, 0))
@@ -726,6 +728,7 @@ class LumaLinkApp:
                 "smoothing": self.var_smoothing.get(),
                 "fps": self.var_fps.get(),
                 "capture_mode": self.var_mode.get(),
+                "segments": self.var_segments.get(),
             }
         )
         return self.cfg

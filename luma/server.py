@@ -17,7 +17,7 @@ from .protocol import (
     LightBridgeSession,
     parse_adv_protocol,
 )
-from .capture import capture_screen_rgb, pop_capture_stats
+from .capture import capture_screen_rgb, capture_screen_zones, pop_capture_stats
 from .smoothing import smooth_alpha
 
 # ==============================================================================
@@ -228,6 +228,8 @@ class BridgeServerController:
         last_bright_dp_time = 0.0
         last_ui_emit_time = 0.0
         last_ui_disp_rgb = (-1, -1, -1)
+        zone_smooth: list[list[float]] = []
+        last_zone_sent: list[tuple[int, int, int]] = []
 
         while not ws.closed and session.paired and not self._stop_event.is_set():
             t0 = time.monotonic()
@@ -306,7 +308,40 @@ class BridgeServerController:
                 or mode_changed
                 or (color_diff >= min_diff)
             )
-            if should_send and not first_frame and session.should_wait_for_ack():
+            segments = max(0, min(20, int(snap.get("segments", 0))))
+            if segments >= 2 and not first_frame:
+                should_send = False
+                try:
+                    zones = capture_screen_zones(segments, mode)
+                except Exception:
+                    zones = [(r, g, b)] * segments
+                if len(zone_smooth) != segments:
+                    zone_smooth = [[float(c) for c in z] for z in zones]
+                    last_zone_sent = []
+                else:
+                    dtz = time.monotonic() - t0 + 1.0 / fps
+                    for zs, z in zip(zone_smooth, zones):
+                        dz = abs(z[0] - zs[0]) + abs(z[1] - zs[1]) + abs(z[2] - zs[2])
+                        a = smooth_alpha(smoothing, dtz, dz)
+                        for k in range(3):
+                            zs[k] = zs[k] * a + z[k] * (1.0 - a)
+                cur = [tuple(int(round(c)) for c in zs) for zs in zone_smooth]
+                changed = (
+                    len(last_zone_sent) != segments
+                    or brightness_changed
+                    or any(
+                        abs(a[0] - b2[0]) + abs(a[1] - b2[1]) + abs(a[2] - b2[2]) >= 3
+                        for a, b2 in zip(cur, last_zone_sent)
+                    )
+                )
+                if changed and not session.should_wait_for_ack():
+                    last_zone_sent = cur
+                    last_sent_brightness = brightness
+                    try:
+                        await self._send_chunks(ws, session.make_segments(cur, brightness))
+                    except Exception:
+                        break
+            elif should_send and not first_frame and session.should_wait_for_ack():
                 should_send = False  # лампа ещё не приняла прошлый цвет — отправим свежий в следующем цикле
 
             if should_send:

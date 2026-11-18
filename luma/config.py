@@ -23,6 +23,7 @@ DEFAULT_CONFIG = {
     "brightness": 100,
     "smoothing": 45,
     "capture_mode": "fullscreen",
+    "segments": 0,
 }
 
 

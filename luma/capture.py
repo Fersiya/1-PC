@@ -31,6 +31,23 @@ if sys.platform == "win32":
         ]
 
 
+def zones_from_bgra(raw: bytes, tw: int, th: int, n: int) -> list[tuple[int, int, int]]:
+    """Средний цвет n вертикальных полос буфера BGRA (tw x th)."""
+    out = []
+    for i in range(n):
+        x0 = i * tw // n
+        x1 = max(x0 + 1, (i + 1) * tw // n)
+        r = g = b = cnt = 0
+        for y in range(th):
+            row = y * tw * 4
+            seg = raw[row + x0 * 4: row + x1 * 4]
+            b += sum(seg[0::4]); g += sum(seg[1::4]); r += sum(seg[2::4])
+            cnt += x1 - x0
+        cnt = max(1, cnt)
+        out.append((r // cnt, g // cnt, b // cnt))
+    return out
+
+
 class FastWindowsCapturer:
     """Сверхбыстрый захват экрана через Windows GDI CreateDIBSection (0.03 мс, 0% CPU).
 
@@ -121,6 +138,24 @@ class FastWindowsCapturer:
         r_sum = sum(raw[2::4])
         cnt = self.tw * self.th
         return r_sum // cnt, g_sum // cnt, b_sum // cnt
+
+    def capture_zones(self, n: int) -> list[tuple[int, int, int]]:
+        """Делит экран на n вертикальных полос (слева направо), средний цвет каждой."""
+        w = self.user32.GetSystemMetrics(0)
+        h = self.user32.GetSystemMetrics(1)
+        if w <= 0 or h <= 0 or not self.ppv_bits.value:
+            return [(0, 0, 0)] * n
+        hdc_screen = self.user32.GetDC(0)
+        if not hdc_screen:
+            return [(0, 0, 0)] * n
+        try:
+            self.gdi32.StretchBlt(
+                self.hdc_mem, 0, 0, self.tw, self.th, hdc_screen, 0, 0, w, h, 0x00CC0020
+            )
+        finally:
+            self.user32.ReleaseDC(0, hdc_screen)
+        raw = ctypes.string_at(self.ppv_bits.value, self.buf_size)
+        return zones_from_bgra(raw, self.tw, self.th, n)
 
     def close(self):
         try:
@@ -272,6 +307,31 @@ def capture_screen_rgb(mode: str = "fullscreen") -> tuple[int, int, int]:
     st["sum"] += dt
     st["max"] = max(st["max"], dt)
     return rgb
+
+
+_zone_state = {"zones": None, "t": 0.0}
+
+
+def capture_screen_zones(n: int, mode: str = "fullscreen") -> list[tuple[int, int, int]]:
+    """Цвета n полос экрана; при перетаскивании окон/нагрузке отдаёт прошлые значения."""
+    st = _zone_state
+    now = time.perf_counter()
+    if st["zones"] is not None and len(st["zones"]) == n:
+        if is_window_moving() or (_cap_state["ema"] > 0 and (now - st["t"]) < _cap_state["ema"] * _BUSY_FACTOR):
+            return st["zones"]
+    cap = get_fast_capturer()
+    zones = None
+    if cap:
+        try:
+            zones = cap.capture_zones(n)
+        except Exception:
+            zones = None
+    if zones is None:
+        zones = [capture_screen_rgb_fallback(mode)] * n
+    dt = time.perf_counter() - now
+    _cap_state["ema"] = dt if _cap_state["ema"] == 0 else _cap_state["ema"] * 0.8 + dt * 0.2
+    st["zones"], st["t"] = zones, now
+    return zones
 
 
 def pop_capture_stats() -> dict:
