@@ -1,6 +1,7 @@
 import ctypes
 from ctypes import wintypes
 import sys
+import time
 
 import mss
 
@@ -205,7 +206,45 @@ def cleanup_fast_capturer() -> None:
         _global_capturer = None
 
 
-def capture_screen_rgb(mode: str = "fullscreen") -> tuple[int, int, int]:
+class GUITHREADINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("flags", wintypes.DWORD),
+        ("hwndActive", wintypes.HWND),
+        ("hwndFocus", wintypes.HWND),
+        ("hwndCapture", wintypes.HWND),
+        ("hwndMenuOwner", wintypes.HWND),
+        ("hwndMoveSize", wintypes.HWND),
+        ("hwndCaret", wintypes.HWND),
+        ("rcCaret", wintypes.RECT),
+    ]
+
+
+def is_window_moving() -> bool:
+    """True, пока пользователь двигает или растягивает окно (GUI_INMOVESIZE)."""
+    if sys.platform != "win32":
+        return False
+    try:
+        info = GUITHREADINFO()
+        info.cbSize = ctypes.sizeof(info)
+        if ctypes.windll.user32.GetGUIThreadInfo(0, ctypes.byref(info)):
+            return bool(info.flags & 0x00000002)
+    except Exception:
+        pass
+    return False
+
+
+# GDI-чтение рабочего стола заставляет DWM делать синхронный снимок — на 144–180 Гц это
+# даёт рывки окон. Поэтому: не снимаем во время перетаскивания окон и держим долю времени
+# захвата не выше ~8% (интервал >= 12 длительностей предыдущего снимка).
+_cap_state = {
+    "rgb": (0, 0, 0), "t": 0.0, "ema": 0.0,
+    "n": 0, "sum": 0.0, "max": 0.0, "skip_drag": 0, "skip_busy": 0,
+}
+_BUSY_FACTOR = 12.0
+
+
+def _capture_screen_rgb_raw(mode: str) -> tuple[int, int, int]:
     cap = get_fast_capturer()
     if cap:
         try:
@@ -213,3 +252,37 @@ def capture_screen_rgb(mode: str = "fullscreen") -> tuple[int, int, int]:
         except Exception:
             pass
     return capture_screen_rgb_fallback(mode)
+
+
+def capture_screen_rgb(mode: str = "fullscreen") -> tuple[int, int, int]:
+    st = _cap_state
+    now = time.perf_counter()
+    if is_window_moving():
+        st["skip_drag"] += 1
+        return st["rgb"]
+    if st["ema"] > 0 and (now - st["t"]) < st["ema"] * _BUSY_FACTOR:
+        st["skip_busy"] += 1
+        return st["rgb"]
+    rgb = _capture_screen_rgb_raw(mode)
+    dt = time.perf_counter() - now
+    st["rgb"] = rgb
+    st["t"] = now
+    st["ema"] = dt if st["ema"] == 0 else st["ema"] * 0.8 + dt * 0.2
+    st["n"] += 1
+    st["sum"] += dt
+    st["max"] = max(st["max"], dt)
+    return rgb
+
+
+def pop_capture_stats() -> dict:
+    """Статистика захвата с прошлого вызова (для диагностики в логе)."""
+    st = _cap_state
+    out = {
+        "n": st["n"],
+        "avg_ms": (st["sum"] / st["n"] * 1000.0) if st["n"] else 0.0,
+        "max_ms": st["max"] * 1000.0,
+        "skip_drag": st["skip_drag"],
+        "skip_busy": st["skip_busy"],
+    }
+    st["n"] = 0; st["sum"] = 0.0; st["max"] = 0.0; st["skip_drag"] = 0; st["skip_busy"] = 0
+    return out

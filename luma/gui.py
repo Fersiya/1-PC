@@ -767,12 +767,18 @@ class LumaLinkApp:
         ts = time.strftime("%H:%M:%S")
         self.log_text.config(state="normal")
         self.log_text.insert("end", f"[{ts}] {msg}\n")
+        # держим в окне последние 400 строк: безлимитный Text с каждой строкой тормозит интерфейс
+        if int(self.log_text.index("end-1c").split(".")[0]) > 400:
+            self.log_text.delete("1.0", "end-400l")
         self.log_text.see("end")
         self.log_text.config(state="disabled")
 
     def _poll_queue(self):
-        while not self.ui_queue.empty():
-            ev = self.ui_queue.get_nowait()
+        for _ in range(60):  # не более 60 событий за тик, чтобы окно не зависало
+            try:
+                ev = self.ui_queue.get_nowait()
+            except queue.Empty:
+                break
             etype = ev.get("type")
             if etype == "log":
                 self._append_log(ev["text"])

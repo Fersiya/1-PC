@@ -17,7 +17,7 @@ from .protocol import (
     LightBridgeSession,
     parse_adv_protocol,
 )
-from .capture import capture_screen_rgb
+from .capture import capture_screen_rgb, pop_capture_stats
 
 # ==============================================================================
 # ФОНОВЫЙ СЕРВЕР (WEBSOCKET + UDP DISCOVERY + АВТОПОДБОР ПРОТОКОЛА)
@@ -218,6 +218,7 @@ class BridgeServerController:
     async def _ambilight_loop(self, ws: web.WebSocketResponse, session: LightBridgeSession):
         smooth_r, smooth_g, smooth_b = 0.0, 0.0, 0.0
         initialized = False
+        next_stats = time.monotonic() + 10.0
         last_sent_rgb = (-100, -100, -100)
         last_sent_brightness = -1.0
         last_sent_mode = ""
@@ -246,6 +247,18 @@ class BridgeServerController:
                 raw_r, raw_g, raw_b = capture_screen_rgb(mode)
             except Exception:
                 raw_r, raw_g, raw_b = 0, 0, 0
+
+            if time.monotonic() >= next_stats:
+                next_stats = time.monotonic() + 10.0
+                cs = pop_capture_stats()
+                self._emit(
+                    "log",
+                    text=(
+                        f"Захват экрана за 10 с: {cs['n']} снимков, среднее {cs['avg_ms']:.2f} мс, "
+                        f"макс {cs['max_ms']:.2f} мс; пропущено: {cs['skip_drag']} при перетаскивании окон, "
+                        f"{cs['skip_busy']} из-за нагрузки"
+                    ),
+                )
 
             if not initialized:
                 smooth_r, smooth_g, smooth_b = float(raw_r), float(raw_g), float(raw_b)
@@ -344,6 +357,8 @@ class BridgeServerController:
         adv_ver: int | None = None
         dp_ack_logged = False
         mtu = 23
+        reports_logged = 0
+        dp_colour_cfg = int(snap.get("dp_colour", 24))
         stream_task: asyncio.Task | None = None
         probe_task: asyncio.Task | None = None
 
@@ -403,7 +418,8 @@ class BridgeServerController:
                     session.handshake_replied = True
                     if probe_task:
                         probe_task.cancel()
-                    self._emit("log", text=f"BLE RX ({len(msg.data)} байт): {msg.data.hex()}")
+                    if not session.paired:  # после Pair поток идёт десятки раз в секунду — не засоряем UI
+                        self._emit("log", text=f"BLE RX ({len(msg.data)} байт): {msg.data.hex()}")
                     try:
                         parsed = session.feed_ble_chunk(msg.data)
                     except ValueError as e:
@@ -476,7 +492,10 @@ class BridgeServerController:
                                 else:
                                     val_str = str(val)
                                 dp_desc.append(f"DP{dpid}={val_str}")
-                            self._emit("log", text=f"Отчёт лампы: {', '.join(dp_desc)}")
+                            only_colour = set(dps) <= {dp_colour_cfg, 61}
+                            if reports_logged < 25 or not only_colour:
+                                reports_logged += 1
+                                self._emit("log", text=f"Отчёт лампы: {', '.join(dp_desc)}")
 
                             # Автоопределение DP для Tuya BLE ламп:
                             if 1 in dps and isinstance(dps[1], bool) and dp_switch == 20:
