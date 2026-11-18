@@ -257,6 +257,13 @@ class LightBridgeSession:
         self.paired = False
         self.handshake_replied = False
         self.is_bound = False
+        self.dp_writes = 0  # отправлено DP-команд
+        self.dp_acks = 0  # подтверждений от лампы
+        self.last_dp_write = 0.0
+        self.awaiting_ack = False
+        self.fast_active = False  # крупные BLE-пакеты (по MTU) включены
+        self._fast_writes0 = 0
+        self._fast_acks0 = 0
 
         self._rx_buf = bytearray()
         self._rx_expected_len = 0
@@ -271,6 +278,13 @@ class LightBridgeSession:
         self.dp_sn = 1
         self.paired = False
         self.handshake_replied = False
+        self.dp_writes = 0  # отправлено DP-команд
+        self.dp_acks = 0  # подтверждений от лампы
+        self.last_dp_write = 0.0
+        self.awaiting_ack = False
+        self.fast_active = False  # крупные BLE-пакеты (по MTU) включены
+        self._fast_writes0 = 0
+        self._fast_acks0 = 0
         self._rx_buf.clear()
         self._rx_expected_len = 0
 
@@ -437,7 +451,42 @@ class LightBridgeSession:
             return struct.pack(">BBH", dp_id, dp_type, len(value)) + value
         return struct.pack(">BBB", dp_id, dp_type, len(value)) + value
 
+    def note_dp_ack(self):
+        self.dp_acks += 1
+        self.awaiting_ack = False
+
+    def enable_fast_chunks(self, chunk: int):
+        """После Pair шлём кадры крупными BLE-пакетами (по MTU): 1 запись вместо 4–5."""
+        if chunk > 20:
+            self.chunk_size = chunk
+            self.fast_active = True
+            self._fast_writes0 = self.dp_writes
+            self._fast_acks0 = self.dp_acks
+
+    def check_fast_fallback(self) -> bool:
+        """Если лампа не подтверждает крупные пакеты — вернуть безопасный размер 20 Б."""
+        if (
+            self.fast_active
+            and self.dp_writes - self._fast_writes0 >= 6
+            and self.dp_acks == self._fast_acks0
+        ):
+            self.fast_active = False
+            self.chunk_size = 20
+            return True
+        return False
+
+    def should_wait_for_ack(self) -> bool:
+        """Не копим очередь в BLE: пока нет подтверждения прошлого цвета (до 120 мс) — ждём."""
+        return (
+            self.dp_acks > 0
+            and self.awaiting_ack
+            and (time.monotonic() - self.last_dp_write) < 0.12
+        )
+
     def _wrap_dp_command(self, dp_packet: bytes) -> list[bytes]:
+        self.dp_writes += 1
+        self.last_dp_write = time.monotonic()
+        self.awaiting_ack = True
         if self.protocol_version >= 4:
             sn = self.dp_sn
             self.dp_sn += 1
@@ -994,6 +1043,9 @@ class BridgeServerController:
                 first_frame = True
                 await asyncio.sleep(0.15)
                 continue
+            if session.check_fast_fallback():
+                self._emit("log", text="Лампа не подтверждает крупные пакеты — возвращаю размер 20 Б")
+                first_frame = True
             snap = self.get_cfg_snapshot()
             fps = max(1, min(30, int(snap.get("fps", 14))))
             brightness = float(snap.get("brightness", 100)) / 100.0
@@ -1047,6 +1099,8 @@ class BridgeServerController:
                 or mode_changed
                 or (color_diff >= min_diff)
             )
+            if should_send and not first_frame and session.should_wait_for_ack():
+                should_send = False  # лампа ещё не приняла прошлый цвет — отправим свежий в следующем цикле
 
             if should_send:
                 include_bright = (
@@ -1100,6 +1154,7 @@ class BridgeServerController:
         dp_mode = int(snap.get("dp_mode", 21))
         adv_ver: int | None = None
         dp_ack_logged = False
+        mtu = 23
         stream_task: asyncio.Task | None = None
         probe_task: asyncio.Task | None = None
 
@@ -1184,6 +1239,9 @@ class BridgeServerController:
                         # 0 — успех, 2 — лампа уже сопряжена (тоже успех)
                         if payload and payload[0] in (0x00, 0x02):
                             session.paired = True
+                            session.enable_fast_chunks(max(20, min(240, mtu - 3)))
+                            if session.fast_active:
+                                self._emit("log", text=f"Крупные BLE-пакеты: {session.chunk_size} Б (MTU {mtu})")
                             self._emit("client_state", connected=True, text="Синхронизация активна!")
                             self._emit("log", text="Авторизация успешна! Трансляция цвета запущена.")
                             await ws.send_str(
@@ -1211,6 +1269,7 @@ class BridgeServerController:
                             await ws.send_str(json.dumps({"status": err_msg, "log": err_msg}))
 
                     elif code in (CODE_DPS, CODE_DPS_V4):
+                        session.note_dp_ack()
                         if payload and payload[-1] != 0x00:
                             self._emit("log", text=f"Лампа отклонила DP-команду (ответ {payload.hex()})")
                         elif not dp_ack_logged:
