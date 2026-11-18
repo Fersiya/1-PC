@@ -18,6 +18,7 @@ from .protocol import (
     parse_adv_protocol,
 )
 from .capture import capture_screen_rgb, pop_capture_stats
+from .smoothing import smooth_alpha
 
 # ==============================================================================
 # ФОНОВЫЙ СЕРВЕР (WEBSOCKET + UDP DISCOVERY + АВТОПОДБОР ПРОТОКОЛА)
@@ -218,6 +219,7 @@ class BridgeServerController:
     async def _ambilight_loop(self, ws: web.WebSocketResponse, session: LightBridgeSession):
         smooth_r, smooth_g, smooth_b = 0.0, 0.0, 0.0
         initialized = False
+        last_smooth_t = time.monotonic()
         next_stats = time.monotonic() + 10.0
         last_sent_rgb = (-100, -100, -100)
         last_sent_brightness = -1.0
@@ -264,11 +266,14 @@ class BridgeServerController:
                 smooth_r, smooth_g, smooth_b = float(raw_r), float(raw_g), float(raw_b)
                 initialized = True
             else:
-                alpha = smoothing
+                now_s = time.monotonic()
+                diff = abs(raw_r - smooth_r) + abs(raw_g - smooth_g) + abs(raw_b - smooth_b)
+                alpha = smooth_alpha(smoothing, now_s - last_smooth_t, diff)
                 smooth_r = smooth_r * alpha + raw_r * (1.0 - alpha)
                 smooth_g = smooth_g * alpha + raw_g * (1.0 - alpha)
                 smooth_b = smooth_b * alpha + raw_b * (1.0 - alpha)
 
+            last_smooth_t = time.monotonic()
             r, g, b = int(round(smooth_r)), int(round(smooth_g)), int(round(smooth_b))
 
             # Визуальный индикатор в интерфейсе с учётом выставленной яркости (частота UI до 12 FPS)
