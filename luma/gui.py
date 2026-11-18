@@ -1,6 +1,7 @@
 import ctypes
 import queue
 import sys
+import threading
 import time
 import tkinter as tk
 from tkinter import messagebox, ttk
@@ -8,6 +9,13 @@ from tkinter import messagebox, ttk
 from .config import APP_NAME, APP_SUBTITLE, get_local_ips, load_config, save_config
 from .capture import cleanup_fast_capturer
 from .server import BridgeServerController
+from .winutil import is_autostart_enabled, set_autostart
+
+try:
+    import pystray
+    HAS_PYSTRAY = True
+except Exception:
+    HAS_PYSTRAY = False
 
 
 try:
@@ -81,14 +89,65 @@ class LumaLinkApp:
         self.ips = get_local_ips()
         self.primary_ip = self.ips[0] if self.ips else "192.168.1.X"
 
+        self.var_tray = tk.BooleanVar(value=bool(self.cfg.get("minimize_to_tray", True)))
+        self.var_autostart = tk.BooleanVar(value=bool(is_autostart_enabled()))
+        self.tray_icon = None
+
         self._setup_clipboard_shortcuts()
         self._build_ui()
         self._poll_queue()
+
+        if HAS_PYSTRAY:
+            self._init_tray()
 
         if self._is_config_valid(silent=True):
             self.controller.start()
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _init_tray(self):
+        try:
+            icon_img = build_window_icon_image(64)
+            if icon_img is None:
+                return
+
+            def on_open(icon, item):
+                self.root.after(0, self.restore_from_tray)
+
+            def on_toggle_server(icon, item):
+                self.root.after(0, self._toggle_server)
+
+            def on_exit(icon, item):
+                self.root.after(0, self.force_exit)
+
+            menu = pystray.Menu(
+                pystray.MenuItem("Открыть LumaLink", on_open, default=True),
+                pystray.MenuItem("Сервер Вкл/Выкл", on_toggle_server),
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem("Выход", on_exit),
+            )
+            self.tray_icon = pystray.Icon(APP_NAME, icon_img, f"{APP_NAME} — {APP_SUBTITLE}", menu)
+            threading.Thread(target=self.tray_icon.run, daemon=True).start()
+        except Exception:
+            self.tray_icon = None
+
+    def restore_from_tray(self):
+        self.root.deiconify()
+        self.root.state("normal")
+        self.root.lift()
+        self.root.focus_force()
+
+    def minimize_to_tray(self):
+        self.root.withdraw()
+
+    def force_exit(self):
+        if self.tray_icon:
+            try:
+                self.tray_icon.stop()
+            except Exception:
+                pass
+            self.tray_icon = None
+        self._on_close(force=True)
 
     def _apply_window_icon(self):
         try:
@@ -519,6 +578,43 @@ class LumaLinkApp:
         )
         btn_save.pack(side="left", padx=(10, 0))
 
+        opts_row = tk.Frame(keys_card, bg=self.BG_CARD)
+        opts_row.pack(fill="x", pady=(8, 0))
+
+        cb_tray = tk.Checkbutton(
+            opts_row,
+            text="Сворачивать в системный трей",
+            variable=self.var_tray,
+            font=("Segoe UI", 9),
+            fg=self.TEXT_PRIMARY,
+            bg=self.BG_CARD,
+            selectcolor=self.BG_INPUT,
+            activebackground=self.BG_CARD,
+            activeforeground=self.TEXT_PRIMARY,
+            command=self._push_live_settings,
+        )
+        cb_tray.pack(side="left")
+
+        def on_toggle_auto():
+            val = self.var_autostart.get()
+            set_autostart(val)
+            self._append_log("Автозапуск с Windows включён" if val else "Автозапуск с Windows отключён")
+            self._push_live_settings()
+
+        cb_auto = tk.Checkbutton(
+            opts_row,
+            text="Запускать с Windows",
+            variable=self.var_autostart,
+            font=("Segoe UI", 9),
+            fg=self.TEXT_PRIMARY,
+            bg=self.BG_CARD,
+            selectcolor=self.BG_INPUT,
+            activebackground=self.BG_CARD,
+            activeforeground=self.TEXT_PRIMARY,
+            command=on_toggle_auto,
+        )
+        cb_auto.pack(side="left", padx=(14, 0))
+
         # Карточка экспресс-теста лампы (для быстрой диагностики работы DPs)
         test_card = tk.Frame(container, bg=self.BG_CARD, highlightbackground=self.BORDER, highlightthickness=1, padx=10, pady=8)
         test_card.pack(fill="x", pady=(0, 10))
@@ -729,6 +825,8 @@ class LumaLinkApp:
                 "fps": self.var_fps.get(),
                 "capture_mode": self.var_mode.get(),
                 "segments": self.var_segments.get(),
+                "minimize_to_tray": self.var_tray.get(),
+                "autostart": self.var_autostart.get(),
             }
         )
         return self.cfg
@@ -808,8 +906,17 @@ class LumaLinkApp:
 
         self.root.after(50, self._poll_queue)
 
-    def _on_close(self):
+    def _on_close(self, force: bool = False):
+        if not force and self.var_tray.get() and HAS_PYSTRAY and self.tray_icon:
+            self.minimize_to_tray()
+            return
         self._push_live_settings(save_disk=True)
+        if self.tray_icon:
+            try:
+                self.tray_icon.stop()
+            except Exception:
+                pass
+            self.tray_icon = None
         self.controller.stop()
         cleanup_fast_capturer()
         if sys.platform == "win32":

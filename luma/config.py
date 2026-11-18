@@ -24,6 +24,8 @@ DEFAULT_CONFIG = {
     "smoothing": 45,
     "capture_mode": "fullscreen",
     "segments": 0,
+    "minimize_to_tray": True,
+    "autostart": False,
 }
 
 

@@ -17,9 +17,14 @@ enable_windows_tweaks()  # до создания окна: High-DPI и тайм�
 from luma.gui import LumaLinkApp  # noqa: E402
 
 
+import sys
+
+
 def main():
     root = tk.Tk()
-    LumaLinkApp(root)
+    app = LumaLinkApp(root)
+    if "--minimized" in sys.argv:
+        app.minimize_to_tray()
     root.mainloop()
 
 
