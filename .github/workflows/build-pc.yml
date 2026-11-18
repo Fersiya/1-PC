@@ -5,6 +5,7 @@ on:
     branches: [ main, master ]
     paths:
       - 'lumalink.py'
+      - 'luma/**'
       - 'requirements.txt'
       - 'icon.ico'
       - '.github/workflows/build-pc.yml'
