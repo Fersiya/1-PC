@@ -117,29 +117,30 @@ class BridgeServerController:
             return
         session = self._active_session
         ws = self._active_ws
-        # При ручном тесте приостанавливаем Ambilight на 30 секунд, чтобы экран не перезаписывал тест
-        self.pause_ambilight_until = time.monotonic() + 30.0
+        # При ручном тесте приостанавливаем Ambilight минимум на 30 секунд (если не была задана более долгая пауза)
+        self.pause_ambilight_until = max(self.pause_ambilight_until, time.monotonic() + 30.0)
         try:
             if dp_type == "bool":
                 chunks = session.make_dp_bool(dp_id, bool(value))
                 state_str = "ВКЛ" if value else "ВЫКЛ"
-                self._emit("log", text=f"Команда: DP {dp_id} (питание) = {state_str} [экран на паузе 30с]")
+                self._emit("log", text=f"Команда: DP {dp_id} (питание) = {state_str}")
                 await self._send_chunks(ws, chunks)
             elif dp_type == "enum":
                 chunks = session.make_dp_enum(dp_id, int(value))
                 mode_names = {0: "White", 1: "Colour", 2: "Scene", 3: "Music"}
-                self._emit("log", text=f"Команда: DP {dp_id} (режим) = {value} ({mode_names.get(int(value), '?')}) [экран на паузе 30с]")
+                self._emit("log", text=f"Команда: DP {dp_id} (режим) = {value} ({mode_names.get(int(value), '?')})")
                 await self._send_chunks(ws, chunks)
             elif dp_type == "value":
                 chunks = session.make_dp_value(dp_id, int(value))
-                self._emit("log", text=f"Команда: DP {dp_id} (значение) = {value} [экран на паузе 30с]")
+                self._emit("log", text=f"Команда: DP {dp_id} (значение) = {value}")
                 await self._send_chunks(ws, chunks)
             elif dp_type == "color":
                 r, g, b = value
                 dp_switch = int(self.get_cfg_snapshot().get("dp_switch", 1))
                 dp_mode = int(self.get_cfg_snapshot().get("dp_mode", 2))
-                chunks = session.make_color_bundle(dp_switch, dp_mode, dp_id, r, g, b, 1.0)
-                self._emit("log", text=f"Команда: Единый пакет Multi-DP (Питание ВКЛ, Режим 1, Ярк 1000, Цвет RGB({r},{g},{b}), DP61 Dreamlight) [экран на паузе 30с]")
+                br_scale = float(self.get_cfg_snapshot().get("brightness", 100)) / 100.0
+                chunks = session.make_color_bundle(dp_switch, dp_mode, dp_id, r, g, b, br_scale)
+                self._emit("log", text=f"Команда: Единый пакет Multi-DP (Питание ВКЛ, Режим 1, Ярк {int(round(br_scale * 1000))}, Цвет RGB({r},{g},{b}), DP61 Dreamlight)")
                 await self._send_chunks(ws, chunks)
             elif dp_type == "mode":
                 dp_switch = int(self.get_cfg_snapshot().get("dp_switch", 1))

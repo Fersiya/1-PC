@@ -78,8 +78,8 @@ class LumaLinkApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title(f"{APP_NAME} — {APP_SUBTITLE}")
-        self.root.geometry("560x800")
-        self.root.minsize(520, 720)
+        self.root.geometry("560x830")
+        self.root.minsize(520, 740)
         self.root.configure(bg=self.BG_MAIN)
 
         self._apply_window_icon()
@@ -94,6 +94,9 @@ class LumaLinkApp:
         self.var_autostart = tk.BooleanVar(value=bool(is_autostart_enabled()))
         self.var_auto_off = tk.BooleanVar(value=bool(self.cfg.get("auto_off_on_sleep", True)))
         self.tray_icon = None
+        self._sliders: dict[str, tuple[ttk.Scale, tk.Label, str]] = {}
+        self._preset_buttons: dict[str, tk.Button] = {}
+        self._active_preset: str | None = None
         self.power_watcher = WindowsPowerWatcher(self.controller.on_power_state_changed)
         self.power_watcher.start()
 
@@ -121,12 +124,20 @@ class LumaLinkApp:
             def on_toggle_server(icon, item):
                 self.root.after(0, self._toggle_server)
 
+            def on_preset(k):
+                self.root.after(0, lambda: self.apply_preset(k))
+
             def on_exit(icon, item):
                 self.root.after(0, self.force_exit)
 
             menu = pystray.Menu(
                 pystray.MenuItem("Открыть LumaLink", on_open, default=True),
                 pystray.MenuItem("Сервер Вкл/Выкл", on_toggle_server),
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem("🎮 Пресет: Игры", lambda icon, item: on_preset("games")),
+                pystray.MenuItem("🎬 Пресет: Кино", lambda icon, item: on_preset("cinema")),
+                pystray.MenuItem("⚡ Пресет: Динамика", lambda icon, item: on_preset("dynamic")),
+                pystray.MenuItem("📖 Пресет: Чтение", lambda icon, item: on_preset("reading")),
                 pystray.Menu.SEPARATOR,
                 pystray.MenuItem("Выход", on_exit),
             )
@@ -431,13 +442,51 @@ class LumaLinkApp:
         )
         ctrl_card.pack(fill="x", pady=(0, 12))
 
+        ctrl_hdr = tk.Frame(ctrl_card, bg=self.BG_CARD)
+        ctrl_hdr.pack(fill="x", pady=(0, 8))
+
         tk.Label(
-            ctrl_card,
+            ctrl_hdr,
             text="Настройки подсветки в реальном времени",
             font=("Segoe UI", 10, "bold"),
             fg=self.TEXT_PRIMARY,
             bg=self.BG_CARD,
-        ).pack(anchor="w", pady=(0, 10))
+        ).pack(side="left")
+
+        presets_row = tk.Frame(ctrl_card, bg=self.BG_CARD)
+        presets_row.pack(fill="x", pady=(0, 8))
+
+        tk.Label(
+            presets_row,
+            text="Пресеты:",
+            font=("Segoe UI", 9, "bold"),
+            fg=self.TEXT_MUTED,
+            bg=self.BG_CARD,
+        ).pack(side="left", padx=(0, 8))
+
+        preset_defs = [
+            ("games", "🎮 Игры"),
+            ("cinema", "🎬 Кино"),
+            ("dynamic", "⚡ Динамика"),
+            ("reading", "📖 Чтение"),
+        ]
+        for p_key, p_lbl in preset_defs:
+            btn = tk.Button(
+                presets_row,
+                text=p_lbl,
+                font=("Segoe UI", 8, "bold"),
+                fg=self.TEXT_PRIMARY,
+                bg=self.BG_INPUT,
+                activebackground=self.BORDER,
+                activeforeground=self.TEXT_PRIMARY,
+                bd=0,
+                padx=8,
+                pady=3,
+                cursor="hand2",
+                command=lambda k=p_key: self.apply_preset(k),
+            )
+            btn.pack(side="left", padx=2)
+            self._preset_buttons[p_key] = btn
 
         self.var_brightness = tk.IntVar(value=int(self.cfg.get("brightness", 100)))
         self.var_smoothing = tk.IntVar(value=int(self.cfg.get("smoothing", 45)))
@@ -445,10 +494,10 @@ class LumaLinkApp:
         self.var_mode = tk.StringVar(value=self.cfg.get("capture_mode", "fullscreen"))
         self.var_segments = tk.IntVar(value=int(self.cfg.get("segments", 0)))
 
-        self._add_slider(ctrl_card, "Яркость лампы", self.var_brightness, 10, 100, "%")
-        self._add_slider(ctrl_card, "Плавность переходов", self.var_smoothing, 0, 85, "%")
-        self._add_slider(ctrl_card, "Частота обновления", self.var_fps, 5, 30, " FPS")
-        self._add_slider(ctrl_card, "Сегменты лампы (0 = один цвет, эксперимент)", self.var_segments, 0, 20, "")
+        self._add_slider(ctrl_card, "Яркость лампы", self.var_brightness, 10, 100, "%", name="brightness")
+        self._add_slider(ctrl_card, "Плавность переходов", self.var_smoothing, 0, 85, "%", name="smoothing")
+        self._add_slider(ctrl_card, "Частота обновления", self.var_fps, 5, 30, " FPS", name="fps")
+        self._add_slider(ctrl_card, "Сегменты лампы (0 = один цвет, эксперимент)", self.var_segments, 0, 20, "", name="segments")
 
         mode_row = tk.Frame(ctrl_card, bg=self.BG_CARD)
         mode_row.pack(fill="x", pady=(6, 0))
@@ -473,7 +522,7 @@ class LumaLinkApp:
                 selectcolor=self.BG_INPUT,
                 activebackground=self.BG_CARD,
                 activeforeground=self.TEXT_PRIMARY,
-                command=self._push_live_settings,
+                command=lambda: (self._set_active_preset_button(None), self._push_live_settings()),
             )
             rb.pack(side="left", padx=(12, 0))
 
@@ -770,7 +819,7 @@ class LumaLinkApp:
         self.log_text.pack(fill="both", expand=True)
         self._attach_log_context_menu(self.log_text)
 
-    def _add_slider(self, parent, title: str, var: tk.IntVar, frm: int, to: int, suffix: str):
+    def _add_slider(self, parent, title: str, var: tk.IntVar, frm: int, to: int, suffix: str, name: str = ""):
         row = tk.Frame(parent, bg=self.BG_CARD)
         row.pack(fill="x", pady=3)
 
@@ -793,6 +842,8 @@ class LumaLinkApp:
             v = int(round(float(val)))
             var.set(v)
             lbl_val.config(text=f"{v}{suffix}")
+            # Пользователь вручную подвинул ползунок — сбрасываем плашку активного пресета
+            self._set_active_preset_button(None)
             # Если подсветка была приостановлена ручным тестом — возобновляем
             if self.controller.pause_ambilight_until > 0:
                 self.controller.resume_ambilight()
@@ -809,6 +860,73 @@ class LumaLinkApp:
         scale.set(var.get())
         scale.bind("<ButtonRelease-1>", on_release)
         scale.pack(side="left", fill="x", expand=True, padx=8)
+
+        if name:
+            self._sliders[name] = (scale, lbl_val, suffix)
+
+    def _update_slider_ui(self, name: str, val: int):
+        if name in self._sliders:
+            scale, lbl_val, suffix = self._sliders[name]
+            scale.set(val)
+            lbl_val.config(text=f"{val}{suffix}")
+
+    def _set_active_preset_button(self, active_key: str | None):
+        self._active_preset = active_key
+        for key, btn in self._preset_buttons.items():
+            if key == active_key:
+                btn.config(bg=self.ACCENT, fg=self.TEXT_PRIMARY)
+            else:
+                btn.config(bg=self.BG_INPUT, fg=self.TEXT_PRIMARY)
+
+    def apply_preset(self, preset_key: str):
+        self._set_active_preset_button(preset_key)
+        if preset_key == "games":
+            self.var_fps.set(30)
+            self._update_slider_ui("fps", 30)
+            self.var_smoothing.set(10)
+            self._update_slider_ui("smoothing", 10)
+            self.var_mode.set("fullscreen")
+            self.var_brightness.set(100)
+            self._update_slider_ui("brightness", 100)
+            self.controller.resume_ambilight()
+            self._push_live_settings(save_disk=True)
+            self._append_log("Применён пресет: 🎮 Игры (30 FPS, отклик 10%, весь экран, яркость 100%)")
+        elif preset_key == "cinema":
+            self.var_fps.set(20)
+            self._update_slider_ui("fps", 20)
+            self.var_smoothing.set(65)
+            self._update_slider_ui("smoothing", 65)
+            self.var_mode.set("edges")
+            self.var_brightness.set(90)
+            self._update_slider_ui("brightness", 90)
+            self.controller.resume_ambilight()
+            self._push_live_settings(save_disk=True)
+            self._append_log("Применён пресет: 🎬 Кино (20 FPS, плавность 65%, края Ambilight, яркость 90%)")
+        elif preset_key == "dynamic":
+            self.var_fps.set(25)
+            self._update_slider_ui("fps", 25)
+            self.var_smoothing.set(30)
+            self._update_slider_ui("smoothing", 30)
+            self.var_mode.set("fullscreen")
+            self.var_brightness.set(100)
+            self._update_slider_ui("brightness", 100)
+            self.controller.resume_ambilight()
+            self._push_live_settings(save_disk=True)
+            self._append_log("Применён пресет: ⚡ Динамика (25 FPS, плавность 30%, весь экран, яркость 100%)")
+        elif preset_key == "reading":
+            self.var_brightness.set(60)
+            self._update_slider_ui("brightness", 60)
+            # Приостанавливаем захват экрана на длительное время (24 часа)
+            self.controller.pause_ambilight(86400.0)
+            # Отправляем тёплый мягкий свет (2700K: RGB 255, 195, 130)
+            warm_rgb = (255, 195, 130)
+            self.controller.send_manual_dp(int(self.var_dp_colour.get() or 24), "color", warm_rgb)
+            self.controller.send_manual_dp(47, "value", 600)
+            hex_col = f"#{warm_rgb[0]:02x}{warm_rgb[1]:02x}{warm_rgb[2]:02x}"
+            self.color_canvas.itemconfig(self.orb_outer, fill=hex_col, outline=hex_col)
+            self.lbl_rgb_info.config(text="Режим: Чтение (тёплый свет 2700K)  •  Яркость: 60%")
+            self._push_live_settings(save_disk=True)
+            self._append_log("Применён пресет: 📖 Чтение (тёплый свет 2700K, яркость 60%, пауза экрана)")
 
     def _add_field(self, parent, label: str, var: tk.StringVar):
         row = tk.Frame(parent, bg=self.BG_CARD)
