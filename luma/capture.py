@@ -276,7 +276,7 @@ _cap_state = {
     "rgb": (0, 0, 0), "t": 0.0, "ema": 0.0,
     "n": 0, "sum": 0.0, "max": 0.0, "skip_drag": 0, "skip_busy": 0,
 }
-_BUSY_FACTOR = 12.0
+_BUSY_FACTOR = 6.0
 
 
 def _capture_screen_rgb_raw(mode: str) -> tuple[int, int, int]:
