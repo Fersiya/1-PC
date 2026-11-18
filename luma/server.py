@@ -44,6 +44,42 @@ class BridgeServerController:
         self.pause_ambilight_until = 0.0
         self._emit("log", text="Синхронизация экрана возобновлена")
 
+    def on_power_state_changed(self, is_active: bool, reason: str = ""):
+        if not self.running or not self._loop:
+            return
+        asyncio.run_coroutine_threadsafe(self._async_handle_power_state(is_active, reason), self._loop)
+
+    async def _async_handle_power_state(self, is_active: bool, reason: str = ""):
+        cfg = self.get_cfg_snapshot()
+        if not cfg.get("auto_off_on_sleep", True):
+            return
+
+        dp_switch = int(cfg.get("dp_switch", 1))
+        ws = self._active_ws
+        session = self._active_session
+
+        if not is_active:
+            self.pause_ambilight_until = float("inf")
+            self._emit("log", text=f"{reason} — выключаю подсветку лампы")
+            if ws and session and not ws.closed and session.paired:
+                try:
+                    chunks = session.make_dp_bool(dp_switch, False)
+                    await self._send_chunks(ws, chunks)
+                except Exception:
+                    pass
+        else:
+            self.pause_ambilight_until = 0.0
+            self._emit("log", text=f"{reason} — включаю лампу и возобновляю подсветку")
+            if ws and session and not ws.closed and session.paired:
+                try:
+                    dp_mode = int(cfg.get("dp_mode", 2))
+                    dp_colour = int(cfg.get("dp_colour", 24))
+                    br = float(cfg.get("brightness", 100)) / 100.0
+                    chunks = session.make_color_bundle(dp_switch, dp_mode, dp_colour, 255, 255, 255, br)
+                    await self._send_chunks(ws, chunks)
+                except Exception:
+                    pass
+
     def update_live_settings(self, new_cfg: dict):
         with self.lock:
             self.cfg.update(new_cfg)

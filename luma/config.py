@@ -26,6 +26,7 @@ DEFAULT_CONFIG = {
     "segments": 0,
     "minimize_to_tray": True,
     "autostart": False,
+    "auto_off_on_sleep": True,
 }
 
 

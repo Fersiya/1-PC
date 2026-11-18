@@ -10,6 +10,7 @@ from .config import APP_NAME, APP_SUBTITLE, get_local_ips, load_config, save_con
 from .capture import cleanup_fast_capturer
 from .server import BridgeServerController
 from .winutil import is_autostart_enabled, set_autostart
+from .power import WindowsPowerWatcher
 
 try:
     import pystray
@@ -91,7 +92,10 @@ class LumaLinkApp:
 
         self.var_tray = tk.BooleanVar(value=bool(self.cfg.get("minimize_to_tray", True)))
         self.var_autostart = tk.BooleanVar(value=bool(is_autostart_enabled()))
+        self.var_auto_off = tk.BooleanVar(value=bool(self.cfg.get("auto_off_on_sleep", True)))
         self.tray_icon = None
+        self.power_watcher = WindowsPowerWatcher(self.controller.on_power_state_changed)
+        self.power_watcher.start()
 
         self._setup_clipboard_shortcuts()
         self._build_ui()
@@ -583,7 +587,7 @@ class LumaLinkApp:
 
         cb_tray = tk.Checkbutton(
             opts_row,
-            text="Сворачивать в системный трей",
+            text="В трей",
             variable=self.var_tray,
             font=("Segoe UI", 9),
             fg=self.TEXT_PRIMARY,
@@ -603,7 +607,7 @@ class LumaLinkApp:
 
         cb_auto = tk.Checkbutton(
             opts_row,
-            text="Запускать с Windows",
+            text="Автозапуск",
             variable=self.var_autostart,
             font=("Segoe UI", 9),
             fg=self.TEXT_PRIMARY,
@@ -613,7 +617,21 @@ class LumaLinkApp:
             activeforeground=self.TEXT_PRIMARY,
             command=on_toggle_auto,
         )
-        cb_auto.pack(side="left", padx=(14, 0))
+        cb_auto.pack(side="left", padx=(10, 0))
+
+        cb_sleep = tk.Checkbutton(
+            opts_row,
+            text="Гасить при сне / Win+L",
+            variable=self.var_auto_off,
+            font=("Segoe UI", 9),
+            fg=self.TEXT_PRIMARY,
+            bg=self.BG_CARD,
+            selectcolor=self.BG_INPUT,
+            activebackground=self.BG_CARD,
+            activeforeground=self.TEXT_PRIMARY,
+            command=self._push_live_settings,
+        )
+        cb_sleep.pack(side="left", padx=(10, 0))
 
         # Карточка экспресс-теста лампы (для быстрой диагностики работы DPs)
         test_card = tk.Frame(container, bg=self.BG_CARD, highlightbackground=self.BORDER, highlightthickness=1, padx=10, pady=8)
@@ -827,6 +845,7 @@ class LumaLinkApp:
                 "segments": self.var_segments.get(),
                 "minimize_to_tray": self.var_tray.get(),
                 "autostart": self.var_autostart.get(),
+                "auto_off_on_sleep": self.var_auto_off.get(),
             }
         )
         return self.cfg
@@ -917,6 +936,11 @@ class LumaLinkApp:
             except Exception:
                 pass
             self.tray_icon = None
+        if hasattr(self, "power_watcher") and self.power_watcher:
+            try:
+                self.power_watcher.stop()
+            except Exception:
+                pass
         self.controller.stop()
         cleanup_fast_capturer()
         if sys.platform == "win32":
